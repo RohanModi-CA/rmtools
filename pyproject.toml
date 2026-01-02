@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rmtools"
+version = "0.1.0"
+description = "Basic tools I use"
+dependencies = [
+    "google == 3.0.0",
+    "google-genai == 1.41.0",
+	"dotenv"
+]
