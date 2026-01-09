@@ -4,6 +4,7 @@ import json
 from dotenv import load_dotenv
 import os
 import warnings
+from typing import Optional
 import tenacity
 
 
@@ -60,60 +61,12 @@ class AI_Instance:
         self.chat = self.client.chats.create(model=self.model)
 
         self.config:dict = {}
+        self._attached_file_uri_paths:dict[str,str] = {}
 
 
-    def _handle_rate_limit(self, ClientError:google.genai.errors.ClientError):
-        retry_delay_s: int = ClientError['e']
-
-    """
-    We need to implement two main features. One is a retry that is sensible,
-    and perhaps that respects the requested time. The second is a simple management
-    thing that 1.) Alerts programs that they are being rate limited, and 2.) allows for
-    configurations to determine the retry behaviour.
-
-    For the alerting programs they are being rate limited, one option is return that alongside
-    the final return, but that would only happen after the function waits a while, and the 
-    main function is kept in the dark. It's not ideal. Another option is perhaps a promise
-    based approach but that seems very clunky and overall, I am not a fan. 
-
-    Another option, possibly, is to have the program pass a Callable into the retry logic,
-    and the retry function will call the Callable, doing whatever thing the program would
-    have done with this information. This seems like by far the best option, but I'm not
-    confident with the whole self thing. If we pass in a self method, that of course needs
-    access to the self object, but is that object passed by reference? If it is, then I think
-    this could work? Because in that case it is not a 'frozen' copy, etc. Also, there was some
-    discussion of 'pickling' when we were considering self issues in mutliprocessing? We will be multiprocessing,
-    so I'm not sure about this.
-
-    We want these alerts so that we can modify the resource limits, perhaps. Or do we? What will we actually do?
-    So right now, we have a limit to the active behaviours. At this current point, we may very well hit that limit.
-
-    Perhaps a better approach that can sidestep all of this is found by not going horizontally, which suffers from
-    all of the limits we have found in our case, but through a 'uniform' approach. This approach can work such that
-    the function tries to keep uniform resource allocation. As in, it attempts to keep the ratio of resource utilization
-    the same as that defined within the resource limits. This solves one of the two major issues with the current approach:
-    rate limited processes eating the entirety of the 'overall' resource limit. However, there is a second major issue,
-    which is that we will be spamming new attempts while the system has already asked us to slow down. This is a transient
-    issue, since it will mostly go away once we fill the resource limit corresponding to AI, or whatever, possibly. But 
-    I think we can't ignore it, since they could block our IP or something for 'spamming' them. Ultimately, I think we
-    need a way to know whether or not they are accepting us or not. 
-
-    And once we know, we probably need a way to actually handle that. If we know they're not taking new requests for the next
-    24seconds, perhaps we should not send anything their way for that time. Which means that _get_legal_task will need to be made
-    aware. Perhaps with a malleable 'resource_cooldown'. I suppose we should have a malleable and a user-set one. 
-
-    So that is well and good, but the issue of knowing when we're being rate limited is highly difficult, I suppose because it requires
-    communicating accross the cpu process barrier. 
-
-    So I think maybe we have to use this manager thing. We will launch tasks with a manager, who will have a dict that can be optionally passed
-    to the functions. I suppose any step will also have a manager_dict_kwarg:str. Then, we will also need to control.
-
-    """
-
-
-    @tenacity.retry
-    def send_message(self, message:str) -> str|dict:
+    def _send_message(self, message:str) -> str|dict:
         """
+        No retry behaviour.
         If structured_output is enabled, this will return a dict.
         Else, it returns just the string of the reply.
         """
@@ -124,9 +77,20 @@ class AI_Instance:
         else:
             return response.text
 
+
+    
+    def send_message(self, message:str)->str|dict:
+        """
+        Retries.
+        If structured_output is enabled, this will return a dict.
+        Else, it returns just the string of the reply. 
+        """
+        self._send_message(message)
+
+
     def attach_file(self, pathtofile:str):
         """
-        We will manipulate this to add into the curated_history,
+        We will manipulate this to add into the curated_history. This adds to _attached_file_tuples
         """
 
         file = self.client.files.upload(file=pathtofile)
@@ -139,6 +103,10 @@ class AI_Instance:
 
         # Now let's add this to the curated history to make it as if we have 'sent' it.
         self.chat._curated_history.append(file_content)
+
+        # And let's add this to the list of attached files in case we want to save the context.
+        self._attached_file_tuples.append()
+
 
     def structured_output(self, schema_filepath:str|None=None, schema_str:str|None=None)->None:
         """
@@ -191,11 +159,27 @@ class AI_Instance:
         self.attach_text(text_filepath=filepath)
         return
         
+    
+    def context_save(self, save_filepath:str, file_preserving_path:str="")->None:
+        #TODO: Implement
+        """ Dumps the context up to now, in JSON format, to save_filepath.
+            Does not preserve response schemas. Files may expire by default. 
+            file_preserving_path changes behaviour completely.
 
+            Args:
+                save_filepath:str, the filepath of where to put the JSON.
+                file_preserving_path: str. If this is set, this will not save the raw context. It will make a JSON with key 'context', value: raw context JSON, and key 'file_tuples'
+            """
+            
+        data = [content.model_dump() for content in self.chat._curated_history]
+        json_str = json.dumps(data)
+
+        if not file_preserving_path:
+            with open(save_filepath, 'w') as context_file:
+                context_file.write(json_str)
+            return
         
-        
-
-
+        # Now, to implement the file tuples. 
 
 
 
