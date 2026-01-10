@@ -1,7 +1,7 @@
 from google import genai
 import google.genai.errors
 import json
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 import os
 import warnings
 from typing import Optional
@@ -44,7 +44,7 @@ class AI_Instance:
         if api_key:
             return api_key
         else:
-            load_dotenv()
+            load_dotenv(find_dotenv(usecwd=True))
             key:str|None = os.getenv('GEMINI_API_KEY')
             
             if not key:
@@ -104,8 +104,9 @@ class AI_Instance:
         # Now let's add this to the curated history to make it as if we have 'sent' it.
         self.chat._curated_history.append(file_content)
 
-        # And let's add this to the list of attached files in case we want to save the context.
-        self._attached_file_tuples.append()
+        #TODO: And let's add this to the list of attached files in case we want to save the context.
+        
+        #self._attached_file_uri_paths.append()
 
 
     def structured_output(self, schema_filepath:str|None=None, schema_str:str|None=None)->None:
