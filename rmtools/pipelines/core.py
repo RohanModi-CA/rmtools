@@ -3,102 +3,49 @@ import numpy as np
 import time
 import multiprocessing
 from multiprocessing.managers import DictProxy
-
-
-
-
-from dataclasses import dataclass, field
 from typing import Any, Callable
 
-class ResourceExhaustionException(Exception):
-    pass
-
-
-@dataclass
-class process_state:
-    resource_cooldowns: dict[str, float]
-    progress: int
-
-
-
-@dataclass
-class resource_cooldown():
-    """
-    Args:
-        fixed_ms: int. Amount of time, in milliseconds, between subsequent runs of a step/dataset that involve this resource.
-        cooldown_expiry_time: Don't set. float, a time.monotonic() time, in seconds, when any non-fixed cooldown on this resource expires. Should really only be set programmatically.
-    """
-    fixed_ms:int
-    cooldown_expiry_time:float=0
-
-@dataclass
-class ProcessStateFunctions():
-    set_progress_func: Callable[[int], None]
-    set_resource_cooldown_func: Callable[[str, int], None]
-    rate_limit_resource_names: list[str]
-
-
-@dataclass
-class step():
-    """
-    Args:
-        inp: an ordered list of tuples of (directory, extension)
-        function:  a callable, which in general shouldn't return anything
-        kwargs: a dictionary {"argname":"argvaue"}, same for all branches
-        out: an ordered list of tuples, for the outputs.
-        special_kwargs: a (similarly) ordered list of string argnames. PP will fill them with the paths to the directory/XXXXX.extension's in inp and out.
-        resource_penalties: keyed by resource types and valued by the penalty float. One needs not put all resource types unless you want a penalty.
-        process_state_functions_kwarg: str, optional, the kwarg that will be filled with a ProcessStateFunctions dataclass to report progress, cooldowns, and resurce names.
-        step_id: str, optional. Must be filled in order to use undo_steps (for routers). Steps left unnamed will be filled with str(step_index).
-
-    """
-    inp: list[tuple[str,str]]
-    out: list[tuple[str,str]]
-    function:Callable
-    special_kwargs:list[str]
-    resource_penalties:dict[str, float]
-    kwargs:dict[str, Any] = field(default_factory=dict)
-    process_state_functions_kwarg: str = ""
-    step_id: str = ""
+from .rmPL_Types import ResourceExhaustionException, process_state, resource_cooldown, ProcessStateFunctions, Step, OnReturnInfoStruct, ParallelOptions, NestedSteps
 
 
 class Parallel():
-    def __init__(self, pipeline_map: list[step | list[step] | list[step | list [step]]], resource_limits:dict[str, int], resource_timeout:int=1000, new_instance_timeout:int=20,resource_cooldowns:dict[str, resource_cooldown]={})->None:
+    def __init__(self, parallel_options:ParallelOptions)->None:
         """
         Args:
-            pipeline_map: A list of steps. You can nest them, if that is easier, with a limit of 3 layers of total depth. (No nesting is one layer).
-            resource_limits: dict[str, int] A dictionary keyed by resource types and valued by the limits on the resources.
-            resource_timeout: int=1000, The time in milliseconds, after a resource exhaustion, before we can attempt to try again.
-            new_instance_timeout:int=20, The time in milliseconds before any attempt to start a new step. 
-            resource_cooldowns:dict[str, resource_cooldown]={}, optional. Keyed by resources. Valued by resource_cooldown's. Only need to touch resource_cooldown.fixed_ms. 
+            parallel_options: ParallelOptions
         """
-        self._unnest_steps(pipeline_map)
-        self.resource_timeout = resource_timeout
-        self.new_instance_timeout = new_instance_timeout
+        self._unnest_steps(parallel_options.pipeline_map)
+        self.resource_timeout = parallel_options.resource_timeout_ms
+        self.new_instance_timeout = parallel_options.new_instance_timeout_ms
 
-        self._setup_resource(resource_limits, resource_cooldowns)
+        self._setup_resource(resource_limits=parallel_options.resource_limits, resource_cooldowns=parallel_options.resource_cooldowns)
         self._set_datasets()
 
         self._create_manager_and_lock()
         self._initialize_state_dict()
-        
 
-        
-    def _unnest_steps(self, pipeline_map: list[step | list[step] | list[step | list [step]]])->None:
-        """ Takes a pipeline map which either a list of steps, a list of steps and list of steps, up to a depth of three.
-            Returns None, and sets self.pipeline_map to a flattened list of steps.
+        self.use_vertical:bool = parallel_options.use_vertical
+        self.clear_orphan_p_log:bool = parallel_options.clear_orphan_p_log
+        self.redundant_process_limit:float = parallel_options.redundant_process_limit
+
+        self._running_processes:list[tuple[int,str]] = []
+
+
+    def _unnest_steps(self, pipeline_map: NestedSteps)->None:
+        """ Takes a pipeline map which either a list of Steps, a list of Steps and list of Steps, up to a depth of three.
+            Returns None, and sets self.pipeline_map to a flattened list of Steps.
         """
-        self.pipeline_map:list[step] = []
+        self.pipeline_map:list[Step] = []
         for val in pipeline_map:
-            if isinstance(val, step):
+            if isinstance(val, Step):
                 self.pipeline_map.append(val)
             elif isinstance(val, list):
                 for val2 in val:
-                    if isinstance(val2, step):
+                    if isinstance(val2, Step):
                         self.pipeline_map.append(val2)
                     elif isinstance(val2, list):
                         for val3 in val2:
-                            if isinstance(val3, step):
+                            if isinstance(val3, Step):
                                 self.pipeline_map.append(val3)
                             else:
                                 raise RecursionError("rmPL: PipelineMap list is too deeply nested or invalid. Limit of 3-depth.")
@@ -140,7 +87,7 @@ class Parallel():
 
     @staticmethod
     def _set_state_dict_progress(state_dict:DictProxy, lock, dataset:str, step_index:int, progress:int)->None:
-        """ Sets the progress of a dataset of a step with the state_dict DictProxy properly.
+        """ Sets the progress of a dataset of a Step with the state_dict DictProxy properly.
 
         Args:
             state_dict: a DictProxy. Should be self.state_dict.
@@ -167,7 +114,7 @@ class Parallel():
 
     
     @staticmethod
-    def _get_process_state_functions(pipeline_map:list[step], state_dict:DictProxy, lock, dataset:str, step_index:int)->ProcessStateFunctions:
+    def _get_process_state_functions(pipeline_map:list[Step], state_dict:DictProxy, lock, dataset:str, step_index:int)->ProcessStateFunctions:
         def set_progress_func(progress:int)->None:
             """
             Sets the progress of the current process.
@@ -183,7 +130,7 @@ class Parallel():
 
             Args:
                 resource:str, the same resource as defined in the resource_limits, etc. 
-                cooldown_ms: int, the amount of time, in milliseconds, that we should wait starting now, before starting another step that uses this resource.
+                cooldown_ms: int, the amount of time, in milliseconds, that we should wait starting now, before starting another Step that uses this resource.
             """
             Parallel._set_state_dict_cooldowns(state_dict, lock, dataset, step_index, resource, cooldown_ms)
             return
@@ -215,8 +162,8 @@ class Parallel():
 
     
     def _handle_process_progress(self, snapshot:dict[str, dict[int, process_state]])->None:
-        """
-        Needs to be in a self.lock. Modifies snapshot in place. Adds p-locks to finished processes, and reduces the utilization.
+        """ Needs to be in a self.lock. Modifies snapshot in place. Adds p-locks to finished processes, and reduces the utilization.
+        Processes with -100 progress are 'reset'. In both cases, remove it from self._running_processes.
         """
         for dataset in snapshot.keys():
             for step_index in snapshot[dataset].keys():
@@ -232,6 +179,20 @@ class Parallel():
                     # remove this utilization
                     for resource, penalty in self.pipeline_map[step_index].resource_penalties.items():
                         self.resource_utilization[resource] -= penalty
+
+                    self._running_processes = [process_tuple for process_tuple in self._running_processes if process_tuple != (step_index, dataset)]
+
+                elif dataset_step_state.progress == -100:
+                    # We delete the p-log.
+                    self._create_p_file(self.pipeline_map, step_index, dataset, 'p-log', delete=True)
+                    # Reset progress to zero.
+                    dataset_step_state.progress = 0
+
+                    # remove this utilization
+                    for resource, penalty in self.pipeline_map[step_index].resource_penalties.items():
+                        self.resource_utilization[resource] -= penalty
+
+                    self._running_processes = [process_tuple for process_tuple in self._running_processes if process_tuple != (step_index, dataset)]
 
 
     def _snapshot_to_state_dict(self, snapshot:dict[str, dict[int, process_state]])->None:
@@ -262,7 +223,7 @@ class Parallel():
 
     def _set_datasets(self)->None:
         """
-        Goes into the inp of the first step in the pipeline
+        Goes into the inp of the first Step in the pipeline
         and then extracts all legal datasets (those starting without
         dots or underscores), and sets these as a list. We will sort
         them. We will take from the first entry in the list.
@@ -326,14 +287,38 @@ class Parallel():
         exists:bool = os.path.exists(dataset_filename)
         return has_p_lock, exists
 
-
     def _has_p_log(self, dir_ext_tuple:tuple[str,str], dataset:str)->bool:
         dataset_basename = os.path.basename(self._get_dataset_filename(dir_ext_tuple, dataset))
         has_p_log: bool = (dataset_basename + ".p-log") in self._get_pipeline_set(directory=dir_ext_tuple[0])
         return has_p_log
+    
+    
+    def _has_p_file(self, dir_ext_tuple:tuple[str,str], dataset:str, p_file:str)->bool:
+        """p_file is either "p-lock" or "p_log"."""
+        dataset_basename = os.path.basename(self._get_dataset_filename(dir_ext_tuple, dataset))
+        has_p_file: bool = (dataset_basename + "." + p_file) in self._get_pipeline_set(directory=dir_ext_tuple[0])
+        return has_p_file
+
+    
+    def _has_its_p_file(self, step_index:int, dataset:str, p_file:str, true_on_any:bool=False)->bool:
+        """p_file is either "p-lock" or "p-log". true_on_any means if any p-file is present, returns true.
+            if not true_on_any, then to return true it must have *all* of its p-files.
+        """
+        the_step = self.pipeline_map[step_index]
+        
+        out=True
+
+        for det in the_step.out:
+            if not self._has_p_file(det, dataset, p_file):
+                out=False
+            else:
+                if true_on_any:
+                    return True
+        return out
+        
 
     def _needs_p_lock(self, dir_ext_tuple:tuple[str, str]):
-        """ Returns whether or not a dir_ext_tuple needs a p-lock by checking if this dir_ext_tuple is the result of a step.
+        """ Returns whether or not a dir_ext_tuple needs a p-lock by checking if this dir_ext_tuple is the result of a Step.
             It only checks the directory.
         """
 
@@ -367,7 +352,7 @@ class Parallel():
 
     def _get_legal_steps(self)->list[int]:
         """
-        Checks for resource exhaustion. Returns a sorted list of step indices. Returns an empty list if none.
+        Checks for resource exhaustion. Returns a sorted list of Step indices. Returns an empty list if none.
         Checks the resource_cooldown.
         """
         legal_step_i:list[int] = []
@@ -390,6 +375,25 @@ class Parallel():
                 legal_step_i.append(index)
         return legal_step_i
 
+    def _list_all_legal_tasks(self)->list[tuple[int, str]]|None:
+        """ Iterates through every step and dataset, listing out all tasks legal to complete. Returns None if None.
+            Raises ResourceExhaustionException if resources are exhausted. """
+        legal_steps:list[int] = self._get_legal_steps()
+        
+        if not legal_steps:
+            raise ResourceExhaustionException()
+        
+        # Now let's iterate through and see which datasets are also legal.
+        out:list[tuple[int,str]] = []
+        for step_i in legal_steps:
+            for dataset in self.datasets:
+                if self._is_legal_dataset_step(step_i, dataset):
+                    out.append((step_i, dataset))
+        if not out:
+            return None
+        else:
+            return out
+
 
     def _find_legal_task(self)->tuple[int, str]|None:
         """
@@ -411,27 +415,106 @@ class Parallel():
                     return (step_i, dataset)
         return None
 
+    def _find_legal_task_vertical(self)->tuple[int, str]|None:
+        """ Returns index of Step and string of the dataset of a legal task to complete.
+        Returns None if none. Can Raise ResourceExhaustionException. Attempts to follow a 'vertical' path."""
+        
+        # Let's get all legal tasks.
+        legal_tasks:list[tuple[int,str]]|None = self._list_all_legal_tasks()
+        if not legal_tasks:
+            return None
 
-    def _is_the_final_step_done(self)->bool:
+        # Now we will want to follow the 'vertical' approach. This is simply done by picking the highest legal step_i we can take.
+        # legal_tasks is increasing in step, then dataset. Thus this will give us the 'first' dataset at the highest step:
+        first_task:tuple[int,str] = max(legal_tasks,key=lambda x:x[0])
+        return first_task
+
+
+    def _are_all_steps_done(self)->bool:
         """Returns whether or not all datasets are complete
-        on the final step
         """
-        dir_ext_tuples: list[tuple[str,str]] = self.pipeline_map[-1].out
+        for step_i in self.pipeline_map:
+            dir_ext_tuples: list[tuple[str,str]] = step_i.out
 
-        for dir_ext_tuple in dir_ext_tuples:
-            for dataset in self.datasets:
-                has_p_lock:tuple[bool, bool] = self._has_p_lock(dir_ext_tuple, dataset) 
-                if False in has_p_lock:
-                    return False
+            for dir_ext_tuple in dir_ext_tuples:
+                for dataset in self.datasets:
+                    has_p_lock:tuple[bool, bool] = self._has_p_lock(dir_ext_tuple, dataset) 
+                    if False in has_p_lock:
+                        return False
         return True
 
 
+    def _get_undone_tasks(self)->list[tuple[int,str]]:
+        """ Checks the output p-locks of each step of each task to
+            see whether or not they're done. Returns list of 
+            (step_index, dataset) of tasks that are not done.
+        """
+
+        out:list[tuple[int,str]] = []
+
+        for step_index, step in enumerate(self.pipeline_map):
+            for dataset in self.datasets:
+                step_dataset_done:bool = False
+                for det in step.out:
+                    if self._has_p_lock(det, dataset)[0]:
+                        step_dataset_done = True
+                        break
+                if not step_dataset_done:
+                    out.append((step_index,dataset))
+        return out
+
+    
+    def _count_task_instances(self, task:tuple[int,str])->int:
+        instances_of_task:list[tuple[int,str]] = [task_i for task_i in self._running_processes if task_i == task]
+        instance_count = len(instances_of_task)
+        return instance_count
+                    
+
+    def _clean_and_get_valid_straggler_task(self)->tuple[int,str]|None:
+        """ 
+        Returns a task tuple (step_index:int, dataset:str) of a straggler task that is eligible to be redundantly run.
+        If self.clear_orphan_p_log is set, then it clears p-logs of tasks not currently running.
+        """
+
+        undone_tasks:list[tuple[int,str]] = self._get_undone_tasks()
+
+        for task in undone_tasks:
+
+            # clear the p_logs if we're not working on it and clear_orphan_p_log is set to True.
+            if self.clear_orphan_p_log:
+                if (self._has_its_p_file(task[0], task[1], 'p-log', true_on_any=True) 
+                    and task not in self._running_processes):
+                    self._create_p_file(self.pipeline_map, task[0], task[1], 'p-log', delete=True)
+            
+            # We will launch this straggler, *again*, even if it is running, provided that we are within limits.
+            instance_count = self._count_task_instances(task)
+            valid_to_retry:bool = True
+
+            # check if we have resources, generally, to do this:
+            if task[0] not in self._get_legal_steps():
+                valid_to_retry = False
+                continue
+
+            # check if, by starting another instance, we'd be over the self._redundant_process_limit fraction of resources.
+            for resource, penalty in self.pipeline_map[task[0]].resource_penalties.items():
+                if ((penalty*(instance_count + 1))/self.resource_limits[resource]) > self.redundant_process_limit:
+                    valid_to_retry = False
+                    break
+
+            if valid_to_retry:
+                self.log(f"rmPL: Redundantly running straggler task: {self.pipeline_map[task[0]].step_id}, dataset {task[1]}")
+                return task
+
+        return None
+
+
+
     @staticmethod
-    def _create_p_file(pipeline_map:list[step], step_index, dataset, p_ext:str, delete:bool=False)->None:
+    def _create_p_file(pipeline_map:list[Step], step_index, dataset, p_ext:str, delete:bool=False)->None:
         """ p_ext is either 'p-lock' or 'p-log'. if delete it deletes the p-file.
         """
 
-        the_step: step = pipeline_map[step_index]
+        the_step: Step = pipeline_map[step_index]
         dir_ext_tuples: list[tuple[str, str]] = the_step.out
 
         for dir_ext_tuple in dir_ext_tuples:
@@ -439,7 +522,7 @@ class Parallel():
             if not delete:
                 with open(log_filename, 'a') as file:
                     file.write('')
-            else:
+            elif delete:
                 if os.path.exists(log_filename):
                     os.remove(log_filename)
                 else:
@@ -447,11 +530,16 @@ class Parallel():
 
 
 
-    def _p_launch_func(self, func: Callable)->Callable:
+    def _p_launch_func(self, func: Callable, on_return:Callable|None)->Callable:
         """ Returns a Callable to a wrapper function which runs func with kwargs and then updates progress when done.
         """
         def wrapped_func(step_index:int, dataset:str, **kwargs)->None: 
-            func(**kwargs)
+            return_val: Any = func(**kwargs)
+
+            if on_return:
+                ORIS: OnReturnInfoStruct = OnReturnInfoStruct(self.pipeline_map, dataset, step_index, self.state_dict, self.lock)
+                on_return(return_val, ORIS)
+
             self._set_state_dict_progress(self.state_dict, self.lock, dataset, step_index, 100)
             
 
@@ -464,7 +552,7 @@ class Parallel():
             starting_task : bool, set to true to increase utilization, etc, or false to signify the completion of a task.
         """
         
-        the_step: step = self.pipeline_map[step_index]
+        the_step: Step = self.pipeline_map[step_index]
 
         # Get resource_penalty: 
         for resource in the_step.resource_penalties.keys():
@@ -484,7 +572,7 @@ class Parallel():
             Adds the ProcessStateFunctions if process_state_functions_kwarg is set.
         """
 
-        the_step:step = self.pipeline_map[step_index]
+        the_step:Step = self.pipeline_map[step_index]
         
         # Let's build the full kwargs.
         full_kwargs: dict = the_step.kwargs.copy()
@@ -507,12 +595,12 @@ class Parallel():
         """ Starts the multiprocessing process for any step and dataset. Does not check anything. Adds a .p-log. Also adds to the resource utilization.
         """
         
-        the_step:step = self.pipeline_map[step_index]
+        the_step:Step = self.pipeline_map[step_index]
         
         full_kwargs:dict[str, Any] = self._build_kwargs(step_index, dataset)
         
         # Let's wrap the function to add the lock when done:
-        target_func:Callable = self._p_launch_func(the_step.function)
+        target_func:Callable = self._p_launch_func(the_step.function, the_step.on_return)
         p = multiprocessing.Process(target=target_func, args=(step_index, dataset), kwargs=full_kwargs)
 
         self._create_p_file(self.pipeline_map, step_index, dataset, 'p-log')
@@ -521,6 +609,7 @@ class Parallel():
         self._update_resource_utilization(step_index, starting_task=True)
         
         self.log(f"rmPP: Started {the_step.function.__name__} for dataset {dataset}.")
+        self._running_processes.append((step_index, dataset))
 
 
         return
@@ -540,16 +629,25 @@ class Parallel():
             self._propagate_state_dict()
 
             try:
-                task = self._find_legal_task()
+                if self.use_vertical:
+                    task = self._find_legal_task_vertical()
+                else:
+                    task = self._find_legal_task()
             except ResourceExhaustionException:
                 time.sleep(self.resource_timeout / 1000)
                 continue
 
             if not task:
                 # Are we done?
-                if self._is_the_final_step_done():
+                if self._are_all_steps_done():
                     stop_reason = "rmPP: All datasets have been completed for the final step."
-                continue
+                    continue
+
+                # do we have stragglers to clean/restart?
+                else: 
+                    task = self._clean_and_get_valid_straggler_task()
+                    if not task:
+                        continue
 
             self._start_multiprocessing_step_dataset(task[0], task[1])
             time.sleep(self.new_instance_timeout / 1000)
@@ -558,14 +656,27 @@ class Parallel():
 
 
     @staticmethod
-    def undo_steps(dataset:str, step_ids: list[str], pipeline_map: list[step])->None:
+    def undo_steps(dataset:str, step_ids: list[str], pipeline_map: list[Step])->None:
         """
         For a given dataset, this function will delete the p-logs and p-locks of the steps in the list. 
         """
 
-        steps_to_delete: list[step|None] = [step_i if step_i.step_id in step_ids else None for step_i in pipeline_map]
+        steps_to_delete: list[Step|None] = [step_i if step_i.step_id in step_ids else None for step_i in pipeline_map]
 
         for step_index, _ in enumerate(steps_to_delete):
             Parallel._create_p_file(pipeline_map, step_index, dataset, 'p-lock', delete=True)
             Parallel._create_p_file(pipeline_map, step_index, dataset, 'p-log', delete=True)
         return
+
+    @staticmethod
+    def gen_verification_router(steps_to_delete_ids:list[str])->Callable:
+        def router(return_val: Any, ORIS: OnReturnInfoStruct)->None:
+            if return_val == False:
+                Parallel.undo_steps(ORIS.dataset, steps_to_delete_ids, ORIS.pipeline_map)
+
+                # Set to -100. This will delete g-log and free resources. Does not create g-lock.
+                Parallel._set_state_dict_progress(ORIS.state_dict, ORIS.lock, ORIS.dataset, ORIS.step_index, -100)
+        return router
+
+
+

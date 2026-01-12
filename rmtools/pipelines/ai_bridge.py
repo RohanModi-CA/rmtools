@@ -1,6 +1,6 @@
 from . import core
 from .. import ai
-from typing import Optional
+from typing import Optional, Any
 from google import genai
 from google.genai import errors
 import tenacity
@@ -85,7 +85,7 @@ class AI_Instance_PL(ai.AI_Instance):
             
         
 
-    def send_message(self, message: str) -> str | dict:
+    def send_message(self, message: str) -> Any:
         """
         Sends a message, returning a dict only if a structured output
         schema has been set. Otherwise returns a string.

@@ -1,4 +1,5 @@
 from google import genai
+from typing import Any
 import google.genai.errors
 import json
 from dotenv import load_dotenv, find_dotenv
@@ -64,7 +65,7 @@ class AI_Instance:
         self._attached_file_uri_paths:dict[str,str] = {}
 
 
-    def _send_message(self, message:str) -> str|dict:
+    def _send_message(self, message:str) -> Any:
         """
         No retry behaviour.
         If structured_output is enabled, this will return a dict.
@@ -79,7 +80,7 @@ class AI_Instance:
 
 
     
-    def send_message(self, message:str)->str|dict:
+    def send_message(self, message:str)->Any:
         """
         Retries.
         If structured_output is enabled, this will return a dict.
