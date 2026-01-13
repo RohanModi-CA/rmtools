@@ -65,12 +65,16 @@ class AI_Instance:
         self._attached_file_uri_paths:dict[str,str] = {}
 
 
-    def _send_message(self, message:str) -> Any:
+    def _send_message(self, message:str="") -> Any:
         """
         No retry behaviour.
         If structured_output is enabled, this will return a dict.
-        Else, it returns just the string of the reply.
+        Else, it returns just the string of the reply. 
+        If not message, sents a space.
         """
+        if not message:
+            message = " "
+
         response = self.chat.send_message(message=message, config=self.config)
 
         if self.config:

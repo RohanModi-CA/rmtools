@@ -85,7 +85,7 @@ class AI_Instance_PL(ai.AI_Instance):
             
         
 
-    def send_message(self, message: str) -> Any:
+    def send_message(self, message: str="") -> Any:
         """
         Sends a message, returning a dict only if a structured output
         schema has been set. Otherwise returns a string.

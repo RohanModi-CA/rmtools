@@ -79,6 +79,8 @@ class ParallelOptions():
         new_instance_timeout:int=20, The time in milliseconds before any attempt to start a new Step. 
         resource_cooldowns:dict[str, resource_cooldown]={}, optional. Keyed by resources. Valued by resource_cooldown's. Only need to touch resource_cooldown.fixed_ms. 
         redundant_process_limit:float=0.0: The portion of the resource limits that each redundant process can use at a time.
+        restrict_datasets:tuple[str,str]|None=None: Only run pipeline on datasets between restrict_datasets[0] and restrict_datasets[1], inclusive. Relies on string sorting.
+        clear_existing:bool=False. If true, all outputs for active datasets (all by default or those in restrict_datasets), will be cleared at the beginning of the program. 
     """
     pipeline_map: NestedSteps
     resource_limits:dict[str, int]
@@ -88,5 +90,7 @@ class ParallelOptions():
     use_vertical:bool=True
     clear_orphan_p_log:bool=True
     redundant_process_limit:float=0.0
+    restrict_datasets:tuple[str,str]|None=None
+    clear_existing:bool=False
 
 

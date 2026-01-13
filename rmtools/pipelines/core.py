@@ -7,6 +7,21 @@ from typing import Any, Callable
 
 from .rmPL_Types import ResourceExhaustionException, process_state, resource_cooldown, ProcessStateFunctions, Step, OnReturnInfoStruct, ParallelOptions, NestedSteps
 
+def _zipsort(array_to_sort_by:list, *args, reverse:bool=False)-> tuple:
+    """
+    Takes a list-like array to sort by, and then as many other list-likes
+    after, they all have to be of the same length. Sorts all lists based on
+    the first list-like, and returns a tuple of all the sorted lists.
+    """
+
+    for listlike in args:
+        if len(listlike) != len(array_to_sort_by):
+            raise ValueError("rmtools.zipsort: arrays of unequal length.")
+
+    combined = sorted(zip(array_to_sort_by, *args), reverse=reverse)
+    return tuple(zip(*combined))
+
+
 
 class Parallel():
     def __init__(self, parallel_options:ParallelOptions)->None:
@@ -19,7 +34,9 @@ class Parallel():
         self.new_instance_timeout = parallel_options.new_instance_timeout_ms
 
         self._setup_resource(resource_limits=parallel_options.resource_limits, resource_cooldowns=parallel_options.resource_cooldowns)
+        self.restrict_datasets:tuple[str, str]|None = parallel_options.restrict_datasets
         self._set_datasets()
+        self._clear_existing(parallel_options.clear_existing)
 
         self._create_manager_and_lock()
         self._initialize_state_dict()
@@ -221,6 +238,23 @@ class Parallel():
         print(message)
 
 
+    def _clear_existing(self, clear_existing:bool=False)->None:
+        if clear_existing:
+            if not self.datasets:
+                self.log("rmPL: No datasets. Can't clear. Logic error? Or no datasets set?")
+                return
+            for dataset in self.datasets:
+                for step_index, step in enumerate(self.pipeline_map):
+                    for dir_ext_tuple in step.out:
+                        self._create_p_file(self.pipeline_map, step_index, dataset, 'p-lock', delete=True)
+                        self._create_p_file(self.pipeline_map, step_index, dataset, 'p-log', delete=True)
+                        filename = self._get_dataset_filename(dir_ext_tuple, dataset)
+                        if os.path.exists(filename):
+                            os.unlink(filename)
+                            self.log(f"rmPL: cleared existing file {filename} due to clear_existing=True.")
+        return
+
+
     def _set_datasets(self)->None:
         """
         Goes into the inp of the first Step in the pipeline
@@ -243,9 +277,19 @@ class Parallel():
         files_in_dir: list[str] = [file for file in files_in_dir if file[0] not in ['.', '_']]
 
         files_in_dir.sort()
+        
+        if not files_in_dir:
+            self.log("rmPL: No datasets. Check your prerequisites files.")
+
+        if self.restrict_datasets:
+            files_in_dir = [file for file in files_in_dir if (file >= self.restrict_datasets[0] and file <= self.restrict_datasets[1])]
+            if not files_in_dir:
+                self.log("rmPL: No datasets after restricting dataset. Did you mistype it?")
 
         self.datasets: list[str] = files_in_dir
         
+
+
 
     def _setup_resource(self, resource_limits:dict[str, int], resource_cooldowns:dict[str, resource_cooldown])->None:
         """
@@ -329,11 +373,10 @@ class Parallel():
         return False
 
 
-    def _is_legal_dataset_step(self, step_index:int, dataset:str)->bool:
-        """
-        Returns whether it is legal to work on *this* particular *dataset* for this step.
+    def _is_legal_dataset_step(self, step_index:int, dataset:str, ensure_no_duplicates:bool=True)->bool:
+        """ Returns whether it is legal to work on *this* particular *dataset* for this step.
         It assumes the step itself is legal, which it may not be. That should be checked,
-        separately, perhaps through _get_legal_steps()
+        separately, perhaps through _get_legal_steps(). Checks for p-logs if ensure_no_duplicates.
         """
         # First thing to do is to check whether the prerequisites are finished.
         for dir_ext_tuple in self.pipeline_map[step_index].inp:
@@ -344,9 +387,10 @@ class Parallel():
                 return False
         
         # Next, just ensure that nobody has already started working on this one.
-        for dir_ext_tuple in self.pipeline_map[step_index].out:
-            if self._has_p_log(dir_ext_tuple, dataset) or self._has_p_lock(dir_ext_tuple, dataset)[0]:
-                return False
+        if ensure_no_duplicates:
+            for dir_ext_tuple in self.pipeline_map[step_index].out:
+                if self._has_p_log(dir_ext_tuple, dataset) or self._has_p_lock(dir_ext_tuple, dataset)[0]:
+                    return False
         return True
    
 
@@ -476,7 +520,20 @@ class Parallel():
         If self.clear_orphan_p_log is set, then it clears p-logs of tasks not currently running.
         """
 
+        """
+        An issue we have here is that this just spams repeats of the current because this returns fast. 
+        I suppose we should make it such that it looks at the undone task with the least amount of instances.
+        """
         undone_tasks:list[tuple[int,str]] = self._get_undone_tasks()
+        undone_task_instance_counts:list[int] = [self._count_task_instances(task) for task in undone_tasks]
+
+        if not undone_tasks:
+            self.log("rmPL: All tasks are complete according to g-locks. If you want to reset, you should also clear the respective g-locks.")
+            return None
+
+        _, undone_tasks = _zipsort(undone_task_instance_counts, undone_tasks, reverse=True)
+        
+
 
         for task in undone_tasks:
 
@@ -495,12 +552,16 @@ class Parallel():
                 valid_to_retry = False
                 continue
 
+            # check if this is legal to do, based on prerequisites
+            if not self._is_legal_dataset_step(task[0], task[1], ensure_no_duplicates=False):
+                valid_to_retry = False
+
             # check if, by starting another instance, we'd be over the self._redundant_process_limit fraction of resources.
             for resource, penalty in self.pipeline_map[task[0]].resource_penalties.items():
                 if ((penalty*(instance_count + 1))/self.resource_limits[resource]) > self.redundant_process_limit:
                     valid_to_retry = False
                     break
-
+    
             if valid_to_retry:
                 self.log(f"rmPL: Redundantly running straggler task: {self.pipeline_map[task[0]].step_id}, dataset {task[1]}")
                 return task
@@ -526,7 +587,8 @@ class Parallel():
                 if os.path.exists(log_filename):
                     os.remove(log_filename)
                 else:
-                    print(f"rmPL: Can't remove nonexistent log file {log_filename}. Skipping.")
+                    # print(f"rmPL: Can't remove nonexistent log file {log_filename}. Skipping.")
+                    pass
 
 
 
