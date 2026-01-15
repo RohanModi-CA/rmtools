@@ -47,3 +47,21 @@ Now, `OnReturnInfoStruct` contains information for routers. It has: `pipeline_ma
 
 Note: by default, steps will set their progress to 100 when done, creating a g-lock, preventing them from being worked on. This behaviour is usually unwanted for routers. Setting progress to -100 in an on_return function will remove g-log, free resources, but not mark the file as done. gen_verification_router does this automatically if return_val == False.
 
+---
+
+Nesting Steps in a Pipeline Map
+---
+
+
+Nesting lists of Steps within a Pipeline map triggers custom behaviour.
+This creates a `block` of Steps. `Blocks` are meant to serve as optional step pipelines. 
+
+
+---
+
+OptionalBlocks
+---
+
+An `OptionalBlock` is essentially a version of `list[Step]`. They are used to address a common router behaviour: Running some steps, sometimes. An OptionalBlock has three components: `start:Step`, `middle:NestedStep` `end:Step` 
+
+

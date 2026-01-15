@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+import shutil
 import os
 import numpy as np
 import time
@@ -5,7 +7,7 @@ import multiprocessing
 from multiprocessing.managers import DictProxy
 from typing import Any, Callable
 
-from .rmPL_Types import ResourceExhaustionException, process_state, resource_cooldown, ProcessStateFunctions, Step, OnReturnInfoStruct, ParallelOptions, NestedSteps
+from .rmPL_Types import Block, ResourceExhaustionException, process_state, resource_cooldown, ProcessStateFunctions, Step, OnReturnInfoStruct, ParallelOptions, NestedSteps, OptionalBlock
 
 def _zipsort(array_to_sort_by:list, *args, reverse:bool=False)-> tuple:
     """
@@ -50,15 +52,22 @@ class Parallel():
 
     def _unnest_steps(self, pipeline_map: NestedSteps)->None:
         """ Takes a pipeline map which either a list of Steps, a list of Steps and list of Steps, up to a depth of three.
-            Returns None, and sets self.pipeline_map to a flattened list of Steps.
+            Returns None, and sets self.pipeline_map to a flattened list of Steps. Also handles the rules of intermediate steps.
         """
         self.pipeline_map:list[Step] = []
+        
+
         for val in pipeline_map:
             if isinstance(val, Step):
                 self.pipeline_map.append(val)
+
             elif isinstance(val, list):
                 for val2 in val:
                     if isinstance(val2, Step):
+                        # By default optional_intermediate_step is None.
+                        if val2.optional_intermediate_step != False:
+                            val2.optional_intermediate_step = True
+
                         self.pipeline_map.append(val2)
                     elif isinstance(val2, list):
                         for val3 in val2:
@@ -70,6 +79,8 @@ class Parallel():
                         raise ValueError("rmPL: PipelineMap list is invalid.")
             else:
                 raise ValueError("rmPL: PipelineMap list is invalid.")
+
+    
 
     
     def _init_step_ids(self)->None:
@@ -316,7 +327,8 @@ class Parallel():
         return set(os.listdir(os.path.join(directory, '.pipeline')))
 
 
-    def _get_dataset_filename(self, dir_ext_tuple:tuple[str,str], dataset:str)->str:
+    @staticmethod
+    def _get_dataset_filename(dir_ext_tuple:tuple[str,str], dataset:str)->str:
         directory = dir_ext_tuple[0]
         extension = dir_ext_tuple[1]
         return os.path.join(directory, f'{dataset}.{extension}')
@@ -475,9 +487,11 @@ class Parallel():
 
 
     def _are_all_steps_done(self)->bool:
-        """Returns whether or not all datasets are complete
+        """Returns whether or not all datasets are complete. Doesn't check optional_intermediate_steps.
         """
         for step_i in self.pipeline_map:
+            if step_i.optional_intermediate_step:
+                continue
             dir_ext_tuples: list[tuple[str,str]] = step_i.out
 
             for dir_ext_tuple in dir_ext_tuples:
@@ -641,10 +655,16 @@ class Parallel():
         
         for i, inp_dir_ext_tuple in enumerate(the_step.inp):
             kwarg = the_step.special_kwargs[i]
+            # if no kwarg, the function doesn't take this argument.
+            if not kwarg:
+                continue
+
             full_kwargs[kwarg] = os.path.join(inp_dir_ext_tuple[0], dataset + '.' + inp_dir_ext_tuple[1])
         for j, out_dir_ext_tuple in enumerate(the_step.out):
             i = j+len(the_step.inp)
             kwarg = the_step.special_kwargs[i]
+            if not kwarg:
+                continue
             full_kwargs[kwarg] = os.path.join(out_dir_ext_tuple[0], dataset + '.' + out_dir_ext_tuple[1])
 
         if the_step.process_state_functions_kwarg:
@@ -732,13 +752,68 @@ class Parallel():
 
     @staticmethod
     def gen_verification_router(steps_to_delete_ids:list[str])->Callable:
+        """Creates a simple verification router. If the return val of the parent Step is False, undoes all steps in 
+        PipelineMap, and does not create a p-lock for itself. """
         def router(return_val: Any, ORIS: OnReturnInfoStruct)->None:
             if return_val == False:
                 Parallel.undo_steps(ORIS.dataset, steps_to_delete_ids, ORIS.pipeline_map)
 
-                # Set to -100. This will delete g-log and free resources. Does not create g-lock.
+                # Set to -100. This will delete g-log and free resources. Does not create p-lock.
                 Parallel._set_state_dict_progress(ORIS.state_dict, ORIS.lock, ORIS.dataset, ORIS.step_index, -100)
         return router
 
+    @staticmethod
+    def gen_optional_step_router(initial_dir_ext_tuples: list[tuple[str,str]], final_dir_ext_tuples:list[tuple[str, str]])->Callable:
+        """ Creates a router to handle steps that are optional. If the return val of the Parent Step is True, then the
+        program will do the following optional steps. Otherwise, it will skip to the first non-optional step, and fill its
+        final_dir_ext_tuples with the content from the initial_dir_ext_tuples. 
+        
+        Args:
+            initial_dir_ext_tuples:list[tuple[str,str]]: The dir_ext_tuples of the files from *before* the optional steps. These MUST be inps of the parent step.
+            final_dir_ext_tuples:list[tuple[str,str]]: The dir_ext_tuples of the first nonoptional step that you will fill with the corresponding entries of initial_dir_ext_tuples. 
+        """
 
+        def router(return_val:Any, ORIS: OnReturnInfoStruct)->None:
+            if return_val == True:
+                # end the current step. note that since the nonoptional step at the end should require the optional steps, they will happen.
+                return
+            else:
+                # We are going to skip the optional steps. And fill in the output of the first nonoptional step.
+                step_index = ORIS.step_index + 1
+                done_with_optional:bool=False
+                for step in ORIS.pipeline_map[ORIS.step_index + 1:]:
+                    if not step.optional_intermediate_step:
+                        done_with_optional = True
+                        break
+                    else: # Optional step:
+                        psf:ProcessStateFunctions = Parallel._get_process_state_functions(ORIS.pipeline_map, ORIS.state_dict, ORIS.lock, ORIS.dataset, step_index)
+                        # Create the p-lock for this optional step by setting progress to 100.
+                        psf.set_progress_func(100)
+
+                    step_index += 1
+                # The first non_optional step
+                if not done_with_optional:
+                    raise ValueError("rmPL: Error. The pipeline map cannot end on an optional step.")
+
+                # Set the output. First let's check that all of the required DETs are here.
+                for det_step in ORIS.pipeline_map[step_index].out:
+                    if det_step not in final_dir_ext_tuples:
+                        raise ValueError("rmPL: Error. Router: final_dir_ext_tuples is missing DETs from the first nonoptional step.")
+                    if len(final_dir_ext_tuples) != len(initial_dir_ext_tuples):
+                        raise ValueError("rmPL: Error. Router: final_dir_ext_tuples and initial_dir_ext_tuples must be the same length.")
+                
+                for index, final_dir_ext_tuple in enumerate(final_dir_ext_tuples):
+
+                    initial_path:str = Parallel._get_dataset_filename(initial_dir_ext_tuples[index], ORIS.dataset)
+                    final_path:str = Parallel._get_dataset_filename(final_dir_ext_tuple, ORIS.dataset)
+                    shutil.copyfile(initial_path, final_path)
+
+                # Once that is done, we'll just mark that last task as done.
+                psf:ProcessStateFunctions = Parallel._get_process_state_functions(ORIS.pipeline_map, ORIS.state_dict, ORIS.lock, ORIS.dataset, step_index)
+                psf.set_progress_func(100)
+            return
+
+        return router
+
+        
 

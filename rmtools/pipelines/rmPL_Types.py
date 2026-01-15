@@ -1,3 +1,4 @@
+from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Union, Sequence
 from multiprocessing.managers import DictProxy
@@ -45,6 +46,7 @@ class Step():
         resource_penalties: keyed by resource types and valued by the penalty float. One needs not put all resource types unless you want a penalty.
         process_state_functions_kwarg: str, optional, the kwarg that will be filled with a ProcessStateFunctions dataclass to report progress, cooldowns, and resurce names.
         step_id: str, optional. Must be filled in order to use undo_steps (for routers). Steps left unnamed will be filled with str(step_index).
+        optional_intermediate_step:bool|None=None. Should we check that this step is done to say we are 'done'? Autoset to True for middle steps in a list[Step] inside a pipeline_map. Setting explicitly to False prevents that behaviour.
 
     """
     inp: list[tuple[str,str]]
@@ -56,6 +58,8 @@ class Step():
     process_state_functions_kwarg: str = ""
     step_id: str = ""
     on_return:Callable|None=None
+    optional_intermediate_step:bool|None=None
+    optional_block_IDs:list[int]=[]
 
 _ListStep = Sequence[Step]
 _NestOne  = Sequence[Union[Step, _ListStep]]
@@ -93,4 +97,11 @@ class ParallelOptions():
     restrict_datasets:tuple[str,str]|None=None
     clear_existing:bool=False
 
+@dataclass(frozen=True)
+class Block():
+    steps: list[Union[Step, Block]]
 
+
+@dataclass(frozen=True)
+class OptionalBlock(Block):
+    pass
