@@ -6,6 +6,9 @@ import time
 import multiprocessing
 from multiprocessing.managers import DictProxy
 from typing import Any, Callable
+import Blocks
+import file_io
+import state_management
 
 from .rmPL_Types import Block, ResourceExhaustionException, process_state, resource_cooldown, ProcessStateFunctions, Step, OnReturnInfoStruct, ParallelOptions, NestedSteps, OptionalBlock
 
@@ -31,7 +34,8 @@ class Parallel():
         Args:
             parallel_options: ParallelOptions
         """
-        self._unnest_steps(parallel_options.pipeline_map)
+        self.pipeline_map: list[Step] = Blocks.process_and_flatten_input_pipeline_map(parallel_options.pipeline_map)
+        
         self.resource_timeout = parallel_options.resource_timeout_ms
         self.new_instance_timeout = parallel_options.new_instance_timeout_ms
 
@@ -49,39 +53,7 @@ class Parallel():
 
         self._running_processes:list[tuple[int,str]] = []
 
-
-    def _unnest_steps(self, pipeline_map: NestedSteps)->None:
-        """ Takes a pipeline map which either a list of Steps, a list of Steps and list of Steps, up to a depth of three.
-            Returns None, and sets self.pipeline_map to a flattened list of Steps. Also handles the rules of intermediate steps.
-        """
-        self.pipeline_map:list[Step] = []
-        
-
-        for val in pipeline_map:
-            if isinstance(val, Step):
-                self.pipeline_map.append(val)
-
-            elif isinstance(val, list):
-                for val2 in val:
-                    if isinstance(val2, Step):
-                        # By default optional_intermediate_step is None.
-                        if val2.optional_intermediate_step != False:
-                            val2.optional_intermediate_step = True
-
-                        self.pipeline_map.append(val2)
-                    elif isinstance(val2, list):
-                        for val3 in val2:
-                            if isinstance(val3, Step):
-                                self.pipeline_map.append(val3)
-                            else:
-                                raise RecursionError("rmPL: PipelineMap list is too deeply nested or invalid. Limit of 3-depth.")
-                    else:
-                        raise ValueError("rmPL: PipelineMap list is invalid.")
-            else:
-                raise ValueError("rmPL: PipelineMap list is invalid.")
-
     
-
     
     def _init_step_ids(self)->None:
         """ Fill in empty step IDs with str(step_index). Must be called after self.pipeline_map has been set and unnested.
@@ -112,63 +84,8 @@ class Parallel():
         self.state_dict = self.manager.dict(temp_dict)
         return
     
-
-    @staticmethod
-    def _set_state_dict_progress(state_dict:DictProxy, lock, dataset:str, step_index:int, progress:int)->None:
-        """ Sets the progress of a dataset of a Step with the state_dict DictProxy properly.
-
-        Args:
-            state_dict: a DictProxy. Should be self.state_dict.
-            lock: a Lock. Should be self.lock
-            dataset: str
-            step_index: int
-            progress: int
-        """
-        
-        with lock:
-            this_dataset:dict[int, process_state] = state_dict[dataset]
-            this_dataset[step_index].progress = progress
-            state_dict[dataset] = this_dataset
-        return
-
     
-    @staticmethod
-    def _set_state_dict_cooldowns(state_dict:DictProxy, lock, dataset:str, step_index:int, resource:str, cooldown_ms: int)->None:
-        with lock:
-            this_dataset:dict[int, process_state] = state_dict[dataset]
-            this_dataset[step_index].resource_cooldowns[resource] = cooldown_ms
-            state_dict[dataset] = this_dataset
-        return
 
-    
-    @staticmethod
-    def _get_process_state_functions(pipeline_map:list[Step], state_dict:DictProxy, lock, dataset:str, step_index:int)->ProcessStateFunctions:
-        def set_progress_func(progress:int)->None:
-            """
-            Sets the progress of the current process.
-
-            Args:
-                progress:int from 0 to 100. Progress will automatically be set to 100 upon completion, so you need not do that to mark as complete.
-            """
-            Parallel._set_state_dict_progress(state_dict, lock, dataset, step_index, progress)
-            return
-        def set_resource_cooldown_func(resource:str, cooldown_ms:int):
-            """
-            Reports resource cooldowns (eg, rate limits) to the main process.
-
-            Args:
-                resource:str, the same resource as defined in the resource_limits, etc. 
-                cooldown_ms: int, the amount of time, in milliseconds, that we should wait starting now, before starting another Step that uses this resource.
-            """
-            Parallel._set_state_dict_cooldowns(state_dict, lock, dataset, step_index, resource, cooldown_ms)
-            return
-
-        # now get the resource names.
-        resource_names:list[str] = list(pipeline_map[step_index].resource_penalties.keys())
-        resource_names:list[str] = [resource for resource in resource_names if resource.lower() != 'overall']
-
-        return ProcessStateFunctions(set_progress_func=set_progress_func, set_resource_cooldown_func=set_resource_cooldown_func, rate_limit_resource_names=resource_names)
-        
     
     def _update_resource_cooldowns(self, snapshot:dict[str, dict[int, process_state]])->None:
         """ Needs to be in a self.lock. Modifies snapshot in place to clear resource cooldowns.
@@ -201,7 +118,7 @@ class Parallel():
                 # Deal with progress
                 if dataset_step_state.progress == 100:
                     # Create a p-lock and set to 110.
-                    self._create_p_file(self.pipeline_map, step_index, dataset, 'p-lock')
+                    file_io.create_p_file(self.pipeline_map, step_index, dataset, 'p-lock')
                     dataset_step_state.progress = 110
 
                     # remove this utilization
@@ -212,7 +129,7 @@ class Parallel():
 
                 elif dataset_step_state.progress == -100:
                     # We delete the p-log.
-                    self._create_p_file(self.pipeline_map, step_index, dataset, 'p-log', delete=True)
+                    file_io.create_p_file(self.pipeline_map, step_index, dataset, 'p-log', delete=True)
                     # Reset progress to zero.
                     dataset_step_state.progress = 0
 
@@ -257,9 +174,9 @@ class Parallel():
             for dataset in self.datasets:
                 for step_index, step in enumerate(self.pipeline_map):
                     for dir_ext_tuple in step.out:
-                        self._create_p_file(self.pipeline_map, step_index, dataset, 'p-lock', delete=True)
-                        self._create_p_file(self.pipeline_map, step_index, dataset, 'p-log', delete=True)
-                        filename = self._get_dataset_filename(dir_ext_tuple, dataset)
+                        file_io.create_p_file(self.pipeline_map, step_index, dataset, 'p-lock', delete=True)
+                        file_io.create_p_file(self.pipeline_map, step_index, dataset, 'p-log', delete=True)
+                        filename = file_io.get_dataset_filename(dir_ext_tuple, dataset)
                         if os.path.exists(filename):
                             os.unlink(filename)
                             self.log(f"rmPL: cleared existing file {filename} due to clear_existing=True.")
@@ -327,31 +244,25 @@ class Parallel():
         return set(os.listdir(os.path.join(directory, '.pipeline')))
 
 
-    @staticmethod
-    def _get_dataset_filename(dir_ext_tuple:tuple[str,str], dataset:str)->str:
-        directory = dir_ext_tuple[0]
-        extension = dir_ext_tuple[1]
-        return os.path.join(directory, f'{dataset}.{extension}')
-
 
     def _has_p_lock(self, dir_ext_tuple:tuple[str,str], dataset:str)->tuple[bool,bool]:
         """Returns a tuple of bools, the first is whether the p_lock exists, the
         second is whether the file itself exists. """
 
-        dataset_filename = self._get_dataset_filename(dir_ext_tuple, dataset)
+        dataset_filename = file_io.get_dataset_filename(dir_ext_tuple, dataset)
         has_p_lock:bool = (os.path.basename(dataset_filename) + ".p-lock") in self._get_pipeline_set(directory=dir_ext_tuple[0])
         exists:bool = os.path.exists(dataset_filename)
         return has_p_lock, exists
 
     def _has_p_log(self, dir_ext_tuple:tuple[str,str], dataset:str)->bool:
-        dataset_basename = os.path.basename(self._get_dataset_filename(dir_ext_tuple, dataset))
+        dataset_basename = os.path.basename(file_io.get_dataset_filename(dir_ext_tuple, dataset))
         has_p_log: bool = (dataset_basename + ".p-log") in self._get_pipeline_set(directory=dir_ext_tuple[0])
         return has_p_log
     
     
     def _has_p_file(self, dir_ext_tuple:tuple[str,str], dataset:str, p_file:str)->bool:
         """p_file is either "p-lock" or "p_log"."""
-        dataset_basename = os.path.basename(self._get_dataset_filename(dir_ext_tuple, dataset))
+        dataset_basename = os.path.basename(file_io.get_dataset_filename(dir_ext_tuple, dataset))
         has_p_file: bool = (dataset_basename + "." + p_file) in self._get_pipeline_set(directory=dir_ext_tuple[0])
         return has_p_file
 
@@ -555,7 +466,7 @@ class Parallel():
             if self.clear_orphan_p_log:
                 if (self._has_its_p_file(task[0], task[1], 'p-log', true_on_any=True) 
                     and task not in self._running_processes):
-                    self._create_p_file(self.pipeline_map, task[0], task[1], 'p-log', delete=True)
+                    file_io.create_p_file(self.pipeline_map, task[0], task[1], 'p-log', delete=True)
             
             # We will launch this straggler, *again*, even if it is running, provided that we are within limits.
             instance_count = self._count_task_instances(task)
@@ -584,10 +495,6 @@ class Parallel():
 
 
 
-    @staticmethod
-    def _create_p_file(pipeline_map:list[Step], step_index, dataset, p_ext:str, delete:bool=False)->None:
-        """ p_ext is either 'p-lock' or 'p-log'. if delete it deletes the p-file.
-        """
 
         the_step: Step = pipeline_map[step_index]
         dir_ext_tuples: list[tuple[str, str]] = the_step.out
@@ -605,9 +512,8 @@ class Parallel():
                     pass
 
 
-
     def _p_launch_func(self, func: Callable, on_return:Callable|None)->Callable:
-        """ Returns a Callable to a wrapper function which runs func with kwargs and then updates progress when done.
+        """ Returns a allable to a wrapper function which runs func with kwargs and then updates progress when done.
         """
         def wrapped_func(step_index:int, dataset:str, **kwargs)->None: 
             return_val: Any = func(**kwargs)
@@ -616,7 +522,7 @@ class Parallel():
                 ORIS: OnReturnInfoStruct = OnReturnInfoStruct(self.pipeline_map, dataset, step_index, self.state_dict, self.lock)
                 on_return(return_val, ORIS)
 
-            self._set_state_dict_progress(self.state_dict, self.lock, dataset, step_index, 100)
+            state_management.set_state_dict_progress(self.state_dict, self.lock, dataset, step_index, 100)
             
 
         return wrapped_func
@@ -668,7 +574,7 @@ class Parallel():
             full_kwargs[kwarg] = os.path.join(out_dir_ext_tuple[0], dataset + '.' + out_dir_ext_tuple[1])
 
         if the_step.process_state_functions_kwarg:
-            full_kwargs[the_step.process_state_functions_kwarg] = self._get_process_state_functions(self.pipeline_map, self.state_dict, self.lock, dataset, step_index)
+            full_kwargs[the_step.process_state_functions_kwarg] = state_management.get_process_state_functions(self.pipeline_map, self.state_dict, self.lock, dataset, step_index)
 
         return full_kwargs
 
@@ -685,7 +591,7 @@ class Parallel():
         target_func:Callable = self._p_launch_func(the_step.function, the_step.on_return)
         p = multiprocessing.Process(target=target_func, args=(step_index, dataset), kwargs=full_kwargs)
 
-        self._create_p_file(self.pipeline_map, step_index, dataset, 'p-log')
+        file_io.create_p_file(self.pipeline_map, step_index, dataset, 'p-log')
         p.start()
 
         self._update_resource_utilization(step_index, starting_task=True)
@@ -736,84 +642,4 @@ class Parallel():
 
         print(f"rmPP: stop_reason: {stop_reason}")
 
-
-    @staticmethod
-    def undo_steps(dataset:str, step_ids: list[str], pipeline_map: list[Step])->None:
-        """
-        For a given dataset, this function will delete the p-logs and p-locks of the steps in the list. 
-        """
-
-        steps_to_delete: list[Step|None] = [step_i if step_i.step_id in step_ids else None for step_i in pipeline_map]
-
-        for step_index, _ in enumerate(steps_to_delete):
-            Parallel._create_p_file(pipeline_map, step_index, dataset, 'p-lock', delete=True)
-            Parallel._create_p_file(pipeline_map, step_index, dataset, 'p-log', delete=True)
-        return
-
-    @staticmethod
-    def gen_verification_router(steps_to_delete_ids:list[str])->Callable:
-        """Creates a simple verification router. If the return val of the parent Step is False, undoes all steps in 
-        PipelineMap, and does not create a p-lock for itself. """
-        def router(return_val: Any, ORIS: OnReturnInfoStruct)->None:
-            if return_val == False:
-                Parallel.undo_steps(ORIS.dataset, steps_to_delete_ids, ORIS.pipeline_map)
-
-                # Set to -100. This will delete g-log and free resources. Does not create p-lock.
-                Parallel._set_state_dict_progress(ORIS.state_dict, ORIS.lock, ORIS.dataset, ORIS.step_index, -100)
-        return router
-
-    @staticmethod
-    def gen_optional_step_router(initial_dir_ext_tuples: list[tuple[str,str]], final_dir_ext_tuples:list[tuple[str, str]])->Callable:
-        """ Creates a router to handle steps that are optional. If the return val of the Parent Step is True, then the
-        program will do the following optional steps. Otherwise, it will skip to the first non-optional step, and fill its
-        final_dir_ext_tuples with the content from the initial_dir_ext_tuples. 
-        
-        Args:
-            initial_dir_ext_tuples:list[tuple[str,str]]: The dir_ext_tuples of the files from *before* the optional steps. These MUST be inps of the parent step.
-            final_dir_ext_tuples:list[tuple[str,str]]: The dir_ext_tuples of the first nonoptional step that you will fill with the corresponding entries of initial_dir_ext_tuples. 
-        """
-
-        def router(return_val:Any, ORIS: OnReturnInfoStruct)->None:
-            if return_val == True:
-                # end the current step. note that since the nonoptional step at the end should require the optional steps, they will happen.
-                return
-            else:
-                # We are going to skip the optional steps. And fill in the output of the first nonoptional step.
-                step_index = ORIS.step_index + 1
-                done_with_optional:bool=False
-                for step in ORIS.pipeline_map[ORIS.step_index + 1:]:
-                    if not step.optional_intermediate_step:
-                        done_with_optional = True
-                        break
-                    else: # Optional step:
-                        psf:ProcessStateFunctions = Parallel._get_process_state_functions(ORIS.pipeline_map, ORIS.state_dict, ORIS.lock, ORIS.dataset, step_index)
-                        # Create the p-lock for this optional step by setting progress to 100.
-                        psf.set_progress_func(100)
-
-                    step_index += 1
-                # The first non_optional step
-                if not done_with_optional:
-                    raise ValueError("rmPL: Error. The pipeline map cannot end on an optional step.")
-
-                # Set the output. First let's check that all of the required DETs are here.
-                for det_step in ORIS.pipeline_map[step_index].out:
-                    if det_step not in final_dir_ext_tuples:
-                        raise ValueError("rmPL: Error. Router: final_dir_ext_tuples is missing DETs from the first nonoptional step.")
-                    if len(final_dir_ext_tuples) != len(initial_dir_ext_tuples):
-                        raise ValueError("rmPL: Error. Router: final_dir_ext_tuples and initial_dir_ext_tuples must be the same length.")
-                
-                for index, final_dir_ext_tuple in enumerate(final_dir_ext_tuples):
-
-                    initial_path:str = Parallel._get_dataset_filename(initial_dir_ext_tuples[index], ORIS.dataset)
-                    final_path:str = Parallel._get_dataset_filename(final_dir_ext_tuple, ORIS.dataset)
-                    shutil.copyfile(initial_path, final_path)
-
-                # Once that is done, we'll just mark that last task as done.
-                psf:ProcessStateFunctions = Parallel._get_process_state_functions(ORIS.pipeline_map, ORIS.state_dict, ORIS.lock, ORIS.dataset, step_index)
-                psf.set_progress_func(100)
-            return
-
-        return router
-
-        
 

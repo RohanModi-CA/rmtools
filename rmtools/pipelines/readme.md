@@ -59,9 +59,51 @@ This creates a `block` of Steps. `Blocks` are meant to serve as optional step pi
 
 ---
 
-OptionalBlocks
+OptionalBlock
 ---
 
-An `OptionalBlock` is essentially a version of `list[Step]`. They are used to address a common router behaviour: Running some steps, sometimes. An OptionalBlock has three components: `start:Step`, `middle:NestedStep` `end:Step` 
+A common thing one wants to do is define a task, or series of tasks, that happen sometimes, and not other times. OptionalBlock was created for this.
+An OptionalBlock, like all other Blocks, contains a .steps item, which is list[Step|Block]. For example, we might define one like this:
 
+```python3
+OB = OptionalBlock(steps=
+[
+    S1: Step,
+    S2: Step,
+    B1: Block,
+    OB1: OptionalBlock,
+    S3: Step
+]
+)
+```
+
+The first step in an OptionalBlock is special: It is the step that determines whether or not the other steps within the OptionalBlock will be run.
+If this first step returns True, the following Steps and Blocks will run. If it does not return True, then it will skip them. 
+
+To do this, all intermediate steps will be marked as completed through `p-lock`s, but no output files will actually be made. It is strongly recommended to
+never use those files as inputs to steps outside of the OptionalBlock. Now, the final step is again special. This final step is sort of the 'output' of the
+OptionalBlock. It should depend on the outputs of the intermediate steps. 
+
+Should we have skipped the intermediate steps, the program will automatically mark this final step as completed through a `p-lock`. In this case, though,
+we will create output files for this step. This way, other steps can either take advantage of whatever work was produced through the optional block, or
+just continue with whatever was there before. Thus, we must set `OptionalBlock.input_DET` to be a list of dir-ext-tuples that existed before the start
+of the OptionalBlock. These will be put into the `OptionalBlock.output_DET` output of the final step. The program will error if `finalStep.out` contains
+dir_ext_tuples not within `OptionalBlock.output_DET`.
+
+
+Note: if the first/last step is a Block, then this refers to the first/last step of that Block. I don't recommend doing that, since it becomes complicated mentally,
+but the program will handle it just fine.
+
+
+CheckRetryBlock
+---
+
+A very common process is: do task 1, do task 2, then check tasks 1 and 2, and restart them if unsatisfactory. This is the role of `CheckRetryBlock`. 
+
+This SubBlock has one special step: the final one. If the final step returns True, we will delete the outputs of all the steps within the Block, and
+start over. 
+
+If you do not want this behaviour, and you only want to reset certain steps, you can set `CheckRetryBlock.step_ids_to_undo`. By default, it
+is `None`, but if it is a `list[str]`, then only those steps will be reset. Careful with that, because you might cause an infinite loop. Do not include
+the step_id of the final step in `CheckRetryBlock.step_ids_to_undo`. 
 

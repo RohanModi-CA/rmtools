@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Any, Callable, Union, Sequence
+from typing import Any, Callable, Union
 from multiprocessing.managers import DictProxy
 
 
@@ -16,7 +16,6 @@ class process_state:
     progress: int
 
 
-
 @dataclass
 class resource_cooldown():
     """
@@ -26,6 +25,7 @@ class resource_cooldown():
     """
     fixed_ms:int
     cooldown_expiry_time:float=0
+
 
 @dataclass
 class ProcessStateFunctions():
@@ -47,7 +47,6 @@ class Step():
         process_state_functions_kwarg: str, optional, the kwarg that will be filled with a ProcessStateFunctions dataclass to report progress, cooldowns, and resurce names.
         step_id: str, optional. Must be filled in order to use undo_steps (for routers). Steps left unnamed will be filled with str(step_index).
         optional_intermediate_step:bool|None=None. Should we check that this step is done to say we are 'done'? Autoset to True for middle steps in a list[Step] inside a pipeline_map. Setting explicitly to False prevents that behaviour.
-
     """
     inp: list[tuple[str,str]]
     out: list[tuple[str,str]]
@@ -57,13 +56,10 @@ class Step():
     kwargs:dict[str, Any] = field(default_factory=dict)
     process_state_functions_kwarg: str = ""
     step_id: str = ""
-    on_return:Callable|None=None
+    on_return:list[RouterType]=[]
     optional_intermediate_step:bool|None=None
-    optional_block_IDs:list[int]=[]
+    _subBlockIds:dict[type, list[int]] = field(default_factory=dict)
 
-_ListStep = Sequence[Step]
-_NestOne  = Sequence[Union[Step, _ListStep]]
-NestedSteps  = Sequence[Union[Step, _NestOne]]
 
 @dataclass
 class OnReturnInfoStruct():
@@ -73,11 +69,28 @@ class OnReturnInfoStruct():
     state_dict:DictProxy
     lock:Any
 
+
+@dataclass(frozen=True)
+class Block():
+    steps: list[Union[Step, Block]]
+
+
+@dataclass(frozen=True)
+class OptionalBlock(Block):
+    input_DET: list[tuple[str, str]]
+    output_DET: list[tuple[str,str]]
+
+
+@dataclass(frozen=True)
+class CheckRetryBlock(Block):
+    step_ids_to_undo: list[str]|None = None
+
+
 @dataclass(frozen=True)
 class ParallelOptions():
     """
     Args:
-        pipeline_map: A list of Steps. You can nest them, if that is easier, with a limit of 3 layers of total depth. (No nesting is one layer).
+        pipeline_map: A Block. Can be nested, or not. Will be processed, then flattened and everything will be run.
         resource_limits: dict[str, int] A dictionary keyed by resource types and valued by the limits on the resources.
         resource_timeout: int=1000, The time in milliseconds, after a resource exhaustion, before we can attempt to try again.
         new_instance_timeout:int=20, The time in milliseconds before any attempt to start a new Step. 
@@ -86,7 +99,7 @@ class ParallelOptions():
         restrict_datasets:tuple[str,str]|None=None: Only run pipeline on datasets between restrict_datasets[0] and restrict_datasets[1], inclusive. Relies on string sorting.
         clear_existing:bool=False. If true, all outputs for active datasets (all by default or those in restrict_datasets), will be cleared at the beginning of the program. 
     """
-    pipeline_map: NestedSteps
+    pipeline_map: Block
     resource_limits:dict[str, int]
     resource_timeout_ms:int=1000
     new_instance_timeout_ms:int=20
@@ -97,11 +110,6 @@ class ParallelOptions():
     restrict_datasets:tuple[str,str]|None=None
     clear_existing:bool=False
 
-@dataclass(frozen=True)
-class Block():
-    steps: list[Union[Step, Block]]
 
 
-@dataclass(frozen=True)
-class OptionalBlock(Block):
-    pass
+RouterType = Callable[[Any, OnReturnInfoStruct],None]
