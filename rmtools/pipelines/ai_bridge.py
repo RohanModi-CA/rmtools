@@ -7,17 +7,18 @@ import tenacity
 
 class AI_Instance_PL(ai.AI_Instance):
 
-    def __init__(self, api_key: str = "", model: str = "", process_state_functions: Optional[core.ProcessStateFunctions]=None, rate_limit_resource_names: list[str]=[])->None:
+    def __init__(self, api_key: str = "", model: str = "", vertex_api_key: str = "", process_state_functions: Optional[core.ProcessStateFunctions]=None, rate_limit_resource_names: list[str]=[])->None:
         """
         Args:
-            api_key: optional str or can be set by GEMINI_API_KEY in a .env file.
+            api_key: optional AI Studio/Gemini Developer API key. Can also be set by GOOGLE_API_KEY or GEMINI_API_KEY.
             model: optional string otherwise defaults to gemini-flash-latest
+            vertex_api_key: optional Vertex AI express API key. Mutually exclusive with api_key.
             process_state_functions: optional, used to report rate limits to the resources in rate_limit_resource
             rate_limit_resource_names: optional, even if process_state_functions is set, this can be autofilled. List of string names of resources to report rate limits to in process_state_functions. 
         """
         self.process_state_functions = process_state_functions
         self._set_rate_limit_resource_names(rate_limit_resource_names)
-        super().__init__(api_key, model)
+        super().__init__(api_key=api_key, model=model, vertex_api_key=vertex_api_key)
 
         
         self._EXPONENTIAL_BACKOFF = tenacity.wait_exponential(min=1, max=300, multiplier=2) 
@@ -95,5 +96,4 @@ class AI_Instance_PL(ai.AI_Instance):
         Retries limit amount of times and sets cooldowns if rate limited.
         """
         return super()._send_message(message)
-
 

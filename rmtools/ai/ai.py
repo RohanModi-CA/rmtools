@@ -41,23 +41,37 @@ class AI_Instance:
         """
         return model
 
-    def _set_api_key(self, api_key:str="")->str:
+    def _env_truthy(self, env_var_name: str)->bool:
+        return os.getenv(env_var_name, "").lower() in ("true", "1")
+
+    def _get_env_api_key(self)->str:
+        return os.getenv('GOOGLE_API_KEY') or os.getenv('GEMINI_API_KEY') or ""
+
+    def _create_client(self, api_key:str="", vertex_api_key:str="")->genai.Client:
+        if api_key and vertex_api_key:
+            raise ValueError("rmAI: Set api_key or vertex_api_key, not both.")
+
+        if vertex_api_key:
+            return genai.Client(vertexai=True, api_key=vertex_api_key)
+
         if api_key:
-            return api_key
-        else:
-            load_dotenv(find_dotenv(usecwd=True))
-            key:str|None = os.getenv('GEMINI_API_KEY')
-            
-            if not key:
-                raise ValueError("rmAI: No API Key or 'GEMINI_API_KEY' in .env")
-            else:
-                api_key = key
-                return api_key
+            return genai.Client(api_key=api_key)
 
-    def __init__(self, api_key:str="", model:str=""):
-        api_key = self._set_api_key(api_key)
+        load_dotenv(find_dotenv(usecwd=True))
+        env_api_key:str = self._get_env_api_key()
 
-        self.client = genai.Client(api_key=api_key)
+        if self._env_truthy('GOOGLE_GENAI_USE_VERTEXAI'):
+            if env_api_key:
+                return genai.Client(vertexai=True, api_key=env_api_key)
+            return genai.Client(vertexai=True)
+
+        if not env_api_key:
+            raise ValueError("rmAI: No API key found. Set api_key, vertex_api_key, GOOGLE_API_KEY, or GEMINI_API_KEY.")
+
+        return genai.Client(api_key=env_api_key)
+
+    def __init__(self, api_key:str="", model:str="", vertex_api_key:str=""):
+        self.client = self._create_client(api_key=api_key, vertex_api_key=vertex_api_key)
         self.model:str = self._model_selector(model)
         self.chat = self.client.chats.create(model=self.model)
 
