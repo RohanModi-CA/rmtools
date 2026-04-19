@@ -90,7 +90,7 @@ class AI_Instance:
         If structured_output is enabled, this will return a dict.
         Else, it returns just the string of the reply. 
         """
-        self._send_message(message)
+        return self._send_message(message)
 
 
     def attach_file(self, pathtofile:str):
@@ -186,6 +186,13 @@ class AI_Instance:
             return
         
         # Now, to implement the file tuples. 
+    
+    def embed_text(self, text: str) -> list[float]:
+        response = self.client.models.embed_content(
+            model="gemini-embedding-001",
+            contents=text,
+        )
+        return response.embeddings[0].values
 
 
 

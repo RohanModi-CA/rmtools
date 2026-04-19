@@ -107,3 +107,11 @@ If you do not want this behaviour, and you only want to reset certain steps, you
 is `None`, but if it is a `list[str]`, then only those steps will be reset. Careful with that, because you might cause an infinite loop. Do not include
 the step_id of the final step in `CheckRetryBlock.step_ids_to_undo`. 
 
+
+RecursionBlock
+---
+
+Sometimes, you'd like to recursively iterate on your data. For example, perhaps you put an image in an upscaler. Then, you check, but you determine it is not upscaled enough, 
+so you want to upscale the upscaled image, again, and again. For this, we have RecursionBlocks. 
+
+

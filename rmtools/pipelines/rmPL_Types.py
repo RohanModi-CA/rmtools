@@ -56,8 +56,7 @@ class Step():
     kwargs:dict[str, Any] = field(default_factory=dict)
     process_state_functions_kwarg: str = ""
     step_id: str = ""
-    on_return:list[RouterType]=[]
-    optional_intermediate_step:bool|None=None
+    on_return:list[RouterType]=field(default_factory=list)
     _subBlockIds:dict[type, list[int]] = field(default_factory=dict)
 
 
@@ -84,6 +83,11 @@ class OptionalBlock(Block):
 @dataclass(frozen=True)
 class CheckRetryBlock(Block):
     step_ids_to_undo: list[str]|None = None
+
+
+@dataclass(frozen=True)
+class RecursionBlock(Block):
+    pass
 
 
 @dataclass(frozen=True)

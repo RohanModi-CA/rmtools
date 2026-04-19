@@ -1,8 +1,8 @@
 from __future__ import annotations
 from typing import Callable, Any
-from rmPL_Types import Block, CheckRetryBlock, OptionalBlock, Step
+from .rmPL_Types import Block, CheckRetryBlock, OptionalBlock, Step
 from dataclasses import dataclass, replace
-import CustomBlocks
+from . import CustomBlocks
 import random
 
 ####### ROUTERS FOR THE SUBCLASSES OF BLOCKS ########
@@ -10,16 +10,26 @@ import random
 def _process_deepest_optionalBlock(optional_block:OptionalBlock, optional_block_ID:int)->Block:
     """ For optionalBlocks, we just need to give them a unique optionalBlock_ID.
     """
-    # We also need to force them to respect the first-step prerequisite.
-
     assign_block_ids(optional_block, OptionalBlock, optional_block_ID)
 
+
+    # We also need to force them to respect the first-step prerequisite.
     _force_first_step_prerequisite_onto_block(optional_block)
+
+
 
     # And we want the first block to have the router for this block.
     if optional_block.steps: # I guess we don't want to break empty optionalBlocks, though that is undefined behaviour.
         first_step:Step = _get_nth_flattened_step(optional_block, 0)
         first_step.on_return.append(CustomBlocks.generate_optional_block_router(optional_block, optional_block_ID))
+
+        # And we need to ensure that the 'short-circuit' skip file is prerequisite.
+        current_inps:int = len(first_step.inp)
+        for dir_ext_tuple in optional_block.input_DET:
+            first_step.inp.append(dir_ext_tuple)
+            # We can put them all at that index and it just pushes the others down.
+            first_step.special_kwargs.insert(current_inps, "")
+
 
     out:Block = Block(steps=optional_block.steps)
     return out
@@ -58,6 +68,8 @@ class _mutableInt():
 
 def assign_block_ids(subBlock:Block, subBlock_type:type, subBlock_ID:int)->None:
     def assign_step_block_id(step:Step)->None:
+        if subBlock_type not in step._subBlockIds.keys():
+            step._subBlockIds[subBlock_type]=[]
         step._subBlockIds[subBlock_type].append(subBlock_ID)
         return
     _apply_func_on_all_steps_within(subBlock, assign_step_block_id)
@@ -178,6 +190,7 @@ def _process_and_convert_subBlock(pipeline_map:Block, subBlock_type:type)->Block
 
 
 
+
 def _force_first_step_prerequisite_onto_block(block: Block)->None:
     """ For optional_blocks, and perhaps for others, the first step
         is special, and we want to ensure that no other steps can
@@ -194,8 +207,12 @@ def _force_first_step_prerequisite_onto_block(block: Block)->None:
         for index, step in enumerate(flattened):
             if index==0:
                 continue
+
+            insertion_index = len(step.inp)
             step.inp.append(dir_ext_tuple)
-            step.special_kwargs.append("")
+
+            # Now we need to insert this "" at the corresponding place; after all the inps.
+            step.special_kwargs.insert(insertion_index, "")
     return
 
 
@@ -249,11 +266,14 @@ def process_and_flatten_input_pipeline_map(pipeline_map:Block)->list[Step]:
         a list of steps for execution.
     """
 
+    #TODO: Fix, right now need this hacky solution:
+    PM = Block(steps=[pipeline_map])
+
     # Assign every step a step_id if needed.
-    _init_step_ids(pipeline_map)
+    _init_step_ids(PM)
 
     # First step: get rid of the subBlocks.
-    cleaned_Block: Block = _full_process(pipeline_map)
+    cleaned_Block: Block = _full_process(PM)
 
     # Now just flatten this
     flattened: list[Step] = _final_flatten(cleaned_Block)

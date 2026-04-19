@@ -47,6 +47,8 @@ class AI_Instance_PL(ai.AI_Instance):
                         return 1000* (2+int(delay_str[:-1]))
         except (AttributeError, KeyError, ValueError):
             pass
+        
+        print(api_error)
 
         return -1
         
