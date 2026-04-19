@@ -15,30 +15,12 @@ warnings.filterwarnings('ignore', thought_signature_warning)
 
 class AI_Instance:
     def _model_selector(self, model:str="")-> str:
-        """
-        Here we will attempt to sanitize the model input.
-        Can we get the available models?
-        """
-    
         default_model:str = "gemini-flash-latest"
 
         if not model:
             print(f"rmAI: No Model Specified, Defaulting to {default_model}")
             model = default_model
 
-        # We will just assume a sanitized model at this point because this gets rate limited and je veux pas m'occuper de ca a ce moment.
-        """
-        models:list = list(self.client.models.list())
-
-        # We need to sanitize the modelname by removing the models/ prefix.
-        # If '/' is not found this will just leave unchanged since find returns -1.
-        self.model_names:list = [model.name[model.name.find('/') + 1:] for model in models]
-
-        if model in self.model_names:
-            return model
-        else:
-            raise ValueError(f"rmAI: Model {model} not found")
-        """
         return model
 
     def _env_truthy(self, env_var_name: str)->bool:
@@ -47,31 +29,31 @@ class AI_Instance:
     def _get_env_api_key(self)->str:
         return os.getenv('GOOGLE_API_KEY') or os.getenv('GEMINI_API_KEY') or ""
 
-    def _create_client(self, api_key:str="", vertex_api_key:str="")->genai.Client:
+    def _create_client(self, api_key:str="", vertex_api_key:str="")->tuple[genai.Client, str]:
         if api_key and vertex_api_key:
             raise ValueError("rmAI: Set api_key or vertex_api_key, not both.")
 
         if vertex_api_key:
-            return genai.Client(vertexai=True, api_key=vertex_api_key)
+            return genai.Client(vertexai=True, api_key=vertex_api_key), "vertex"
 
         if api_key:
-            return genai.Client(api_key=api_key)
+            return genai.Client(api_key=api_key), "gemini"
 
         load_dotenv(find_dotenv(usecwd=True))
         env_api_key:str = self._get_env_api_key()
 
         if self._env_truthy('GOOGLE_GENAI_USE_VERTEXAI'):
             if env_api_key:
-                return genai.Client(vertexai=True, api_key=env_api_key)
-            return genai.Client(vertexai=True)
+                return genai.Client(vertexai=True, api_key=env_api_key), "vertex"
+            return genai.Client(vertexai=True), "vertex"
 
         if not env_api_key:
             raise ValueError("rmAI: No API key found. Set api_key, vertex_api_key, GOOGLE_API_KEY, or GEMINI_API_KEY.")
 
-        return genai.Client(api_key=env_api_key)
+        return genai.Client(api_key=env_api_key), "gemini"
 
     def __init__(self, api_key:str="", model:str="", vertex_api_key:str=""):
-        self.client = self._create_client(api_key=api_key, vertex_api_key=vertex_api_key)
+        self.client, self._client_mode = self._create_client(api_key=api_key, vertex_api_key=vertex_api_key)
         self.model:str = self._model_selector(model)
         self.chat = self.client.chats.create(model=self.model)
 
@@ -80,12 +62,6 @@ class AI_Instance:
 
 
     def _send_message(self, message:str="") -> Any:
-        """
-        No retry behaviour.
-        If structured_output is enabled, this will return a dict.
-        Else, it returns just the string of the reply. 
-        If not message, sents a space.
-        """
         if not message:
             message = " "
 
@@ -99,41 +75,36 @@ class AI_Instance:
 
     
     def send_message(self, message:str)->Any:
-        """
-        Retries.
-        If structured_output is enabled, this will return a dict.
-        Else, it returns just the string of the reply. 
-        """
         return self._send_message(message)
 
 
+    def _infer_mime_type(self, path: str) -> str:
+        import mimetypes
+        mime_type, _ = mimetypes.guess_type(path)
+        return mime_type or "application/octet-stream"
+
     def attach_file(self, pathtofile:str):
         """
-        We will manipulate this to add into the curated_history. This adds to _attached_file_tuples
+        Attaches a local file to the chat.
+        - Gemini Developer API: uses client.files.upload()
+        - Vertex: uses Part.from_bytes() for inline bytes
         """
+        if self._client_mode == "vertex":
+            with open(pathtofile, "rb") as f:
+                data = f.read()
+            mime_type = self._infer_mime_type(pathtofile)
+            file_part = genai.types.Part.from_bytes(data=data, mime_type=mime_type)
+        else:
+            file = self.client.files.upload(file=pathtofile)
+            if not file or not file.uri:
+                raise Exception("rmAI: Failed to Upload File")
+            file_part = genai.types.Part.from_uri(file_uri=file.uri, mime_type=file.mime_type)
 
-        file = self.client.files.upload(file=pathtofile)
-        
-        if not file or not file.uri:
-            raise Exception("rmAI: Failed to Upload File")
-
-        file_part:genai.types.Part = genai.types.Part.from_uri(file_uri=file.uri, mime_type=file.mime_type)
-        file_content:genai.types.Content =genai.types.Content(parts=[file_part])
-
-        # Now let's add this to the curated history to make it as if we have 'sent' it.
+        file_content = genai.types.Content(parts=[file_part])
         self.chat._curated_history.append(file_content)
-
-        #TODO: And let's add this to the list of attached files in case we want to save the context.
-        
-        #self._attached_file_uri_paths.append()
 
 
     def structured_output(self, schema_filepath:str|None=None, schema_str:str|None=None)->None:
-        """
-        This function sets the config of the current AI instance to include the structured output.
-        Pass either the filepath to the JSON or the JSON as a string (not both), or neither to clear.
-        """
-
         if schema_filepath and schema_str:
             raise(ValueError("rmtools.ai: Structured output takes a filepath OR the string of the JSON, not both."))
 
@@ -146,7 +117,6 @@ class AI_Instance:
             self.config = {}
             return
 
-        # We need to convert the strings to JSON.
         json_dict:dict = json.loads(json_str)
 
         self.config = {'response_mime_type': 'application/json', 'response_json_schema': json_dict}
@@ -172,25 +142,12 @@ class AI_Instance:
 
 
     def load_prompt(self, prompt_name:str, prompts_dir_path:str="prompts"):
-        """
-        Adds the contents of prompts_dir_path/prompt_name.txt to the context.
-        """
         filepath = os.path.join(prompts_dir_path, f'{prompt_name}.txt')
         self.attach_text(text_filepath=filepath)
         return
         
     
     def context_save(self, save_filepath:str, file_preserving_path:str="")->None:
-        #TODO: Implement
-        """ Dumps the context up to now, in JSON format, to save_filepath.
-            Does not preserve response schemas. Files may expire by default. 
-            file_preserving_path changes behaviour completely.
-
-            Args:
-                save_filepath:str, the filepath of where to put the JSON.
-                file_preserving_path: str. If this is set, this will not save the raw context. It will make a JSON with key 'context', value: raw context JSON, and key 'file_tuples'
-            """
-            
         data = [content.model_dump() for content in self.chat._curated_history]
         json_str = json.dumps(data)
 
@@ -199,7 +156,6 @@ class AI_Instance:
                 context_file.write(json_str)
             return
         
-        # Now, to implement the file tuples. 
     
     def embed_text(self, text: str) -> list[float]:
         response = self.client.models.embed_content(
@@ -210,24 +166,5 @@ class AI_Instance:
 
 
 
-
-        
-
-
-
 class rmAI_Pipeline:
-    """
-    The idea we will do here is to create a system where
-    we can define a pipeline, and this will run it automatically.
-    We're not particularly interested in integrations like N8N is,
-    we just want a simple thing.
-
-    A basic example:
-    a function creates a string str1. str1 is then sent to AI with a prompt. 
-    the AI then responds with rep1. func2 processes this, and returns str2, which is run
-    into a verifier, which decides that this was a failure, and then sends us back to the first step, 
-    for example.
-
-    This will be linear. We will define a series of steps. So a step, simply put, has an input, and an out
-    """
     pass
