@@ -88,12 +88,18 @@ class AI_Instance_PL(ai.AI_Instance):
             
         
 
-    def send_message(self, message: str="") -> Any:
+    def send_message(self, message: str="", alert_replied:bool=True) -> Any:
         """
         Sends a message, returning a dict only if a structured output
         schema has been set. Otherwise returns a string.
 
         Retries limit amount of times and sets cooldowns if rate limited.
         """
-        return super()._send_message(message)
+        
+        response = super()._send_message(message)
+        if alert_replied:
+            print("AI_Instance_PL: Received response.")
+        return response
+
+
 

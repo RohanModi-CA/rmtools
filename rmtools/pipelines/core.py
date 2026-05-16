@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import sys
 import shutil
 import os
 import numpy as np
@@ -46,6 +47,7 @@ class Parallel():
 
         self._create_manager_and_lock()
         self._initialize_state_dict()
+        self._log_cursors = {} # maps (step_index, dataset) -> file byte offset
 
         self.use_vertical:bool = parallel_options.use_vertical
         self.clear_orphan_p_log:bool = parallel_options.clear_orphan_p_log
@@ -179,6 +181,28 @@ class Parallel():
                             os.unlink(filename)
                             self.log(f"rmPL: cleared existing file {filename} due to clear_existing=True.")
         return
+
+
+    def _stream_logs_to_console(self):
+        for step_index, dataset in self._running_processes:
+            # Match the path logic used in _p_launch_func
+            log_path = os.path.join(self.pipeline_map[step_index].out[0][0], ".pipeline", "logs", dataset, "stdout_err.txt")
+            
+            if os.path.exists(log_path):
+                with open(log_path, "r") as f:
+                    # Seek to where we last stopped reading
+                    last_pos = self._log_cursors.get((step_index, dataset), 0)
+                    f.seek(last_pos)
+                    
+                    new_data = f.read()
+                    if new_data:
+                        # Print with a prefix so you know which process it came from
+                        prefix = f"[{self.pipeline_map[step_index].step_id} | {dataset}]: "
+                        print(prefix + new_data.replace("\n", f"\n{prefix}").strip(prefix))
+                        
+                    self._log_cursors[(step_index, dataset)] = f.tell()
+            else:
+                print("Warning: log for stdout_err not found")
 
 
     def _set_datasets(self)->None:
@@ -629,21 +653,61 @@ class Parallel():
 
             return None
 
-    def _p_launch_func(self, func: Callable, on_return:list[RouterType])->Callable:
-        """ Returns a allable to a wrapper function which runs func with kwargs and then updates progress when done.
-        """
-        def wrapped_func(step_index:int, dataset:str, **kwargs)->None: 
-            return_val: Any = func(**kwargs)
+    if False:
+        def _p_launch_func(self, func: Callable, on_return:list[RouterType])->Callable:
+            """ Returns a callable to a wrapper function which runs func with kwargs and then updates progress when done.
+            """
+            def wrapped_func(step_index:int, dataset:str, **kwargs)->None: 
+                return_val: Any = func(**kwargs)
 
-            if on_return:
-                ORIS: OnReturnInfoStruct = OnReturnInfoStruct(self.pipeline_map, dataset, step_index, self.state_dict, self.lock)
-                for router in on_return:
-                    router(return_val, ORIS)
+                if on_return:
+                    ORIS: OnReturnInfoStruct = OnReturnInfoStruct(self.pipeline_map, dataset, step_index, self.state_dict, self.lock)
+                    for router in on_return:
+                        router(return_val, ORIS)
 
-            state_management.set_state_dict_progress(self.state_dict, self.lock, dataset, step_index, 100)
-            
+                state_management.set_state_dict_progress(self.state_dict, self.lock, dataset, step_index, 100)
+                
 
-        return wrapped_func
+            return wrapped_func
+        
+
+
+    def _p_launch_func(self, func: Callable, on_return: list[RouterType]) -> Callable:
+            def wrapped_func(step_index: int, dataset: str, **kwargs) -> None:
+                # 1. Determine the log directory based on the Step's output folder
+                # We look at the first output directory defined for this step
+                the_step = self.pipeline_map[step_index]
+                
+                # Use the first output directory defined for this step
+                base_out_dir = the_step.out[0][0] 
+                log_dir = os.path.join(base_out_dir, ".pipeline", "logs", dataset)
+
+                os.makedirs(log_dir, exist_ok=True)
+                log_path = os.path.join(log_dir, "stdout_err.txt")
+
+                # 2. Redirect to the file
+                with open(log_path, "a", buffering=1) as log_file:
+                    sys.stdout = log_file
+                    sys.stderr = log_file
+
+                    try:
+                        return_val: Any = func(**kwargs)
+
+                        if on_return:
+                            ORIS: OnReturnInfoStruct = OnReturnInfoStruct(self.pipeline_map, dataset, step_index, self.state_dict, self.lock)
+                            for router in on_return:
+                                router(return_val, ORIS)
+
+                        state_management.set_state_dict_progress(self.state_dict, self.lock, dataset, step_index, 100)
+                    except Exception:
+                        print(f"\n--- ERROR IN STEP {the_step.step_id} ---", file=sys.stderr)
+                        import traceback
+                        traceback.print_exc(file=sys.stderr)
+                        raise 
+                    finally:
+                        log_file.flush()
+
+            return wrapped_func
 
 
     def _update_resource_utilization(self, step_index:int, starting_task:bool)->None:
@@ -734,6 +798,7 @@ class Parallel():
         while not stop_reason:
 
             self._propagate_state_dict()
+            self._stream_logs_to_console()
 
             try:
                 if self.use_vertical:

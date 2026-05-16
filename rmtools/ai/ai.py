@@ -1,6 +1,7 @@
 from google import genai
 from typing import Any
 import google.genai.errors
+from google.genai import types
 import json
 from dotenv import load_dotenv, find_dotenv
 import os
@@ -9,13 +10,23 @@ from typing import Optional
 import tenacity
 
 
+"""
+filter the warning. I think it's through logging but let's leave the warning one as well.
+"""
 thought_signature_warning:str =  "there are non-text parts in the response: ['thought_signature']"
 warnings.filterwarnings('ignore', thought_signature_warning)
+import logging
+class SuppressGenAINonTextWarning(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "there are non-text parts in the response" not in record.getMessage()
+logging.getLogger("google_genai.types").addFilter(SuppressGenAINonTextWarning())
+
+
 
 
 class AI_Instance:
     def _model_selector(self, model:str="")-> str:
-        default_model:str = "gemini-flash-latest"
+        default_model:str = "gemini-2.5-flash"
 
         if not model:
             print(f"rmAI: No Model Specified, Defaulting to {default_model}")
@@ -26,8 +37,39 @@ class AI_Instance:
     def _env_truthy(self, env_var_name: str)->bool:
         return os.getenv(env_var_name, "").lower() in ("true", "1")
 
-    def _get_env_api_key(self)->str:
-        return os.getenv('GOOGLE_API_KEY') or os.getenv('GEMINI_API_KEY') or ""
+    def _thinking_budget_from_level(self, thinking_level: float) -> int:
+        if not 0.0 <= thinking_level <= 1.0:
+            raise ValueError("rmAI: thinking must be between 0 and 1.")
+
+        model_name = self.model.lower()
+
+        if "flash-lite" in model_name:
+            min_budget, max_budget = 0, 24576
+        elif "flash" in model_name:
+            min_budget, max_budget = 0, 24576
+        else:
+            min_budget, max_budget = 128, 32768
+
+        if thinking_level <= 0.0:
+            return min_budget
+
+        if thinking_level >= 1.0:
+            return max_budget
+
+        return round(min_budget + (max_budget - min_budget) * thinking_level)
+
+    def _build_config(self) -> types.GenerateContentConfig | None:
+        config_kwargs = dict(self.config)
+
+        if self.thinking is not None:
+            config_kwargs["thinking_config"] = types.ThinkingConfig(
+                thinking_budget=self._thinking_budget_from_level(self.thinking)
+            )
+
+        if not config_kwargs:
+            return None
+
+        return types.GenerateContentConfig(**config_kwargs)
 
     def _create_client(self, api_key:str="", vertex_api_key:str="")->tuple[genai.Client, str]:
         if api_key and vertex_api_key:
@@ -40,32 +82,41 @@ class AI_Instance:
             return genai.Client(api_key=api_key), "gemini"
 
         load_dotenv(find_dotenv(usecwd=True))
-        env_api_key:str = self._get_env_api_key()
+        env_google_api_key:str = os.getenv("GOOGLE_API_KEY") or ""
+        env_gemini_api_key:str = os.getenv("GEMINI_API_KEY") or ""
+
+        if env_google_api_key:
+            return genai.Client(vertexai=True, api_key=env_google_api_key), "vertex"
 
         if self._env_truthy('GOOGLE_GENAI_USE_VERTEXAI'):
-            if env_api_key:
-                return genai.Client(vertexai=True, api_key=env_api_key), "vertex"
+            if env_gemini_api_key:
+                return genai.Client(vertexai=True, api_key=env_gemini_api_key), "vertex"
             return genai.Client(vertexai=True), "vertex"
 
-        if not env_api_key:
+        if env_gemini_api_key:
+            return genai.Client(api_key=env_gemini_api_key), "gemini"
+
+        if not env_google_api_key:
             raise ValueError("rmAI: No API key found. Set api_key, vertex_api_key, GOOGLE_API_KEY, or GEMINI_API_KEY.")
 
-        return genai.Client(api_key=env_api_key), "gemini"
+        return genai.Client(vertexai=True, api_key=env_google_api_key), "vertex"
 
-    def __init__(self, api_key:str="", model:str="", vertex_api_key:str=""):
+    def __init__(self, api_key:str="", model:str="", vertex_api_key:str="", thinking: float | None = None):
         self.client, self._client_mode = self._create_client(api_key=api_key, vertex_api_key=vertex_api_key)
         self.model:str = self._model_selector(model)
         self.chat = self.client.chats.create(model=self.model)
 
         self.config:dict = {}
+        self.thinking:float | None = None
         self._attached_file_uri_paths:dict[str,str] = {}
+        self.set_thinking(thinking)
 
 
     def _send_message(self, message:str="") -> Any:
         if not message:
             message = " "
 
-        response = self.chat.send_message(message=message, config=self.config)
+        response = self.chat.send_message(message=message, config=self._build_config())
 
         if self.config:
             return dict(json.loads(response.text))
@@ -76,6 +127,16 @@ class AI_Instance:
     
     def send_message(self, message:str)->Any:
         return self._send_message(message)
+
+    def set_thinking(self, thinking: float | None = None) -> None:
+        if thinking is None:
+            self.thinking = None
+            return
+
+        if not 0.0 <= thinking <= 1.0:
+            raise ValueError("rmAI: thinking must be between 0 and 1.")
+
+        self.thinking = thinking
 
 
     def _infer_mime_type(self, path: str) -> str:
@@ -100,7 +161,7 @@ class AI_Instance:
                 raise Exception("rmAI: Failed to Upload File")
             file_part = genai.types.Part.from_uri(file_uri=file.uri, mime_type=file.mime_type)
 
-        file_content = genai.types.Content(parts=[file_part])
+        file_content = genai.types.Content(role="user", parts=[file_part])
         self.chat._curated_history.append(file_content)
 
 
@@ -136,7 +197,7 @@ class AI_Instance:
 
 
         text_part:genai.types.Part = genai.types.Part(text=text)
-        text_content:genai.types.Content = genai.types.Content(parts=[text_part])
+        text_content:genai.types.Content = genai.types.Content(role="user", parts=[text_part])
         
         self.chat._curated_history.append(text_content)
 
@@ -166,5 +227,3 @@ class AI_Instance:
 
 
 
-class rmAI_Pipeline:
-    pass
