@@ -108,7 +108,8 @@ class ParallelOptions():
     resource_timeout_ms:int=1000
     new_instance_timeout_ms:int=20
     resource_cooldowns:dict[str,resource_cooldown]=field(default_factory=dict)
-    use_vertical:bool=True
+    use_vertical:bool=False
+    use_vertical_cache:bool=True
     clear_orphan_p_log:bool=True
     redundant_process_limit:float=0.0
     restrict_datasets:tuple[str,str]|None=None

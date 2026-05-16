@@ -28,7 +28,6 @@ def _zipsort(array_to_sort_by:list, *args, reverse:bool=False)-> tuple:
     return tuple(zip(*combined))
 
 
-
 class Parallel():
     def __init__(self, parallel_options:ParallelOptions)->None:
         """
@@ -54,8 +53,8 @@ class Parallel():
         self.redundant_process_limit:float = parallel_options.redundant_process_limit
 
         self._running_processes:list[tuple[int,str]] = []
-
-    
+        self.legal_task_cache: list[tuple[int, str]]|None = None
+        self.use_vertical_cache:bool = parallel_options.use_vertical_cache
     
     def _init_step_ids(self)->None:
         """ Fill in empty step IDs with str(step_index). Must be called after self.pipeline_map has been set and unnested.
@@ -419,6 +418,62 @@ class Parallel():
         return first_task
 
 
+    def _find_legal_task_vertical_cache(self)->tuple[int, str]|None:
+        """
+        Returns index of Step and string of dataset of a legal task to complete.
+        Returns none if none. Can Raise ResourceExhaustionException. Attempts to be vertical.
+        Uses a cache of probably legal tasks to identify a candidate. If the directory 
+        is not being used by anyone else this will only contain always legal. However 
+        the task selected will be verified to be expressly legal, and if it's not, 
+        we will regenerate the cache. This will fail after 3 attempts.
+        Ensure that if you are using the cache, you remove them after you start them.
+        """
+
+        retry_limit: int = 3
+        for _ in range(retry_limit):
+            # First thing to do: generate the cache if one does not exist.
+            if self.legal_task_cache is None:
+                self.legal_task_cache = self._list_all_legal_tasks()
+                
+                if not self.legal_task_cache:
+                    return None
+
+                # sort it
+                self.legal_task_cache.sort(key=lambda x: x[0], reverse=True)
+
+            if not self.legal_task_cache:
+                return None
+
+            # highest level step_i. 
+            cache_first_task:tuple[int,str] = self.legal_task_cache[0]
+            # verify it actually is still legal.
+            if self._is_legal_dataset_step(*cache_first_task):
+                return cache_first_task
+            else:
+                # delete the cache so we can try this again
+                self.legal_task_cache = None
+                continue
+
+        raise RuntimeError("rmPP:Continued cache failures. What's going on in your directory? Consider disabling cache.")
+            
+    
+
+    def _remove_task_from_legal_task_cache(self, task:tuple[int,str])->None:
+        # cache should be sorted and we usually only want to remove the first
+        # element from it so we'll just do a simple search
+        if not self.legal_task_cache:
+            raise Exception("rmPP: this should not happen. Sorry! Cache-issue. Disable cache.")
+        for index, task_i in enumerate(self.legal_task_cache):
+            if task == task_i:
+                self.legal_task_cache = self.legal_task_cache[:index] + self.legal_task_cache[index+1:]
+                break
+        return
+        
+
+
+
+
+
     def _are_all_steps_done(self)->bool:
         """Returns whether or not all datasets are complete. 
         """
@@ -458,128 +513,6 @@ class Parallel():
         instance_count = len(instances_of_task)
         return instance_count
                     
-    if False:
-        def _clean_and_get_valid_straggler_task(self)->tuple[int,str]|None:
-            """ 
-            Returns a task tuple (step_index:int, dataset:str) of a straggler task that is eligible to be redundantly run.
-            If self.clear_orphan_p_log is set, then it clears p-logs of tasks not currently running.
-            """
-
-            """
-            An issue we have here is that this just spams repeats of the current because this returns fast. 
-            I suppose we should make it such that it looks at the undone task with the least amount of instances.
-            """
-            undone_tasks:list[tuple[int,str]] = self._get_undone_tasks()
-            undone_task_instance_counts:list[int] = [self._count_task_instances(task) for task in undone_tasks]
-
-            if not undone_tasks:
-                self.log("rmPL: All tasks are complete according to g-locks. If you want to reset, you should also clear the respective g-locks.")
-                return None
-
-            _, undone_tasks = _zipsort(undone_task_instance_counts, undone_tasks, reverse=True)
-            
-
-
-            for task in undone_tasks:
-
-                # clear the p_logs if we're not working on it and clear_orphan_p_log is set to True.
-                if self.clear_orphan_p_log:
-                    if (self._has_its_p_file(task[0], task[1], 'p-log', true_on_any=True) 
-                        and task not in self._running_processes):
-                        file_io.create_p_file(self.pipeline_map, task[0], task[1], 'p-log', delete=True)
-                
-                # We will launch this straggler, *again*, even if it is running, provided that we are within limits.
-                instance_count = self._count_task_instances(task)
-                valid_to_retry:bool = True
-
-                # check if we have resources, generally, to do this:
-                if task[0] not in self._get_legal_steps():
-                    valid_to_retry = False
-                    continue
-
-                # check if this is legal to do, based on prerequisites
-                if not self._is_legal_dataset_step(task[0], task[1], ensure_no_duplicates=False):
-                    valid_to_retry = False
-
-                # check if, by starting another instance, we'd be over the self._redundant_process_limit fraction of resources.
-                for resource, penalty in self.pipeline_map[task[0]].resource_penalties.items():
-                    if ((penalty*(instance_count + 1))/self.resource_limits[resource]) > self.redundant_process_limit:
-                        valid_to_retry = False
-                        break
-        
-                if valid_to_retry:
-                    self.log(f"rmPL: Redundantly running straggler task: {self.pipeline_map[task[0]].step_id}, dataset {task[1]}")
-                    return task
-
-            return None
-
-
-    if False:
-        def _clean_and_get_valid_straggler_task(self)->tuple[int,str]|None:
-            """ 
-            Returns a task tuple (step_index:int, dataset:str) of a straggler task that is eligible to be redundantly run.
-            If self.clear_orphan_p_log is set, then it clears p-logs of tasks not currently running.
-            """
-
-            # If redundancy is disabled, do not launch duplicate work.
-            if self.redundant_process_limit <= 0:
-                return None
-
-            undone_tasks: list[tuple[int, str]] = self._get_undone_tasks()
-            undone_task_instance_counts: list[int] = [self._count_task_instances(task) for task in undone_tasks]
-
-            if not undone_tasks:
-                self.log("rmPL: All tasks are complete according to g-locks. If you want to reset, you should also clear the respective g-locks.")
-                return None
-
-            _, undone_tasks = _zipsort(undone_task_instance_counts, undone_tasks, reverse=True)
-
-            for task in undone_tasks:
-                step_index, dataset = task
-
-                # Optionally clear orphan p-logs for tasks that are not currently running.
-                if self.clear_orphan_p_log:
-                    if self._has_its_p_file(step_index, dataset, 'p-log', true_on_any=True) and task not in self._running_processes:
-                        file_io.create_p_file(self.pipeline_map, step_index, dataset, 'p-log', delete=True)
-
-                instance_count = self._count_task_instances(task)
-
-                # Only consider tasks already in flight as candidates for redundant relaunch.
-                if instance_count == 0:
-                    continue
-
-                # Step must still be legal from a resource perspective.
-                if step_index not in self._get_legal_steps():
-                    continue
-
-                # Prereqs must still be satisfied; allow duplicate instances.
-                if not self._is_legal_dataset_step(step_index, dataset, ensure_no_duplicates=False):
-                    continue
-
-                step = self.pipeline_map[step_index]
-
-                # If no penalties are defined, we cannot safely budget redundant work.
-                if not step.resource_penalties:
-                    continue
-
-                valid_to_retry = True
-                for resource, penalty in step.resource_penalties.items():
-                    limit = self.resource_limits[resource]
-
-                    # Guard against invalid limits.
-                    if limit <= 0:
-                        valid_to_retry = False
-                        break
-
-                    if ((penalty * (instance_count + 1)) / limit) > self.redundant_process_limit:
-                        valid_to_retry = False
-                        break
-
-                if valid_to_retry:
-                    self.log(f"rmPL: Redundantly running straggler task: {step.step_id}, dataset {dataset}")
-                    return task
-
-            return None
 
     def _clean_and_get_valid_straggler_task(self) -> tuple[int, str] | None:
             """ 
@@ -652,24 +585,6 @@ class Parallel():
                     return task
 
             return None
-
-    if False:
-        def _p_launch_func(self, func: Callable, on_return:list[RouterType])->Callable:
-            """ Returns a callable to a wrapper function which runs func with kwargs and then updates progress when done.
-            """
-            def wrapped_func(step_index:int, dataset:str, **kwargs)->None: 
-                return_val: Any = func(**kwargs)
-
-                if on_return:
-                    ORIS: OnReturnInfoStruct = OnReturnInfoStruct(self.pipeline_map, dataset, step_index, self.state_dict, self.lock)
-                    for router in on_return:
-                        router(return_val, ORIS)
-
-                state_management.set_state_dict_progress(self.state_dict, self.lock, dataset, step_index, 100)
-                
-
-            return wrapped_func
-        
 
 
     def _p_launch_func(self, func: Callable, on_return: list[RouterType]) -> Callable:
@@ -801,7 +716,9 @@ class Parallel():
             self._stream_logs_to_console()
 
             try:
-                if self.use_vertical:
+                if self.use_vertical_cache:
+                    task = self._find_legal_task_vertical_cache()
+                elif self.use_vertical:
                     task = self._find_legal_task_vertical()
                 else:
                     task = self._find_legal_task()
@@ -814,7 +731,6 @@ class Parallel():
                 if self._are_all_steps_done():
                     stop_reason = "rmPP: All datasets have been completed for the final step."
                     continue
-
                 # do we have stragglers to clean/restart?
                 else: 
                     task = self._clean_and_get_valid_straggler_task()
@@ -822,6 +738,10 @@ class Parallel():
                         continue
 
             self._start_multiprocessing_step_dataset(task[0], task[1])
+
+            if self.use_vertical_cache:
+                self._remove_task_from_legal_task_cache(task)
+
             time.sleep(self.new_instance_timeout / 1000)
 
         print(f"rmPP: stop_reason: {stop_reason}")
