@@ -53,6 +53,8 @@ class Parallel():
         self.redundant_process_limit:float = parallel_options.redundant_process_limit
 
         self._running_processes:list[tuple[int,str]] = []
+        self._finished_processes:list[tuple[int,str]] = []
+        self._prepopulate_finished_processes()
         self.legal_task_cache: list[tuple[int, str]]|None = None
         self.use_vertical_cache:bool = parallel_options.use_vertical_cache
     
@@ -124,7 +126,11 @@ class Parallel():
                     for resource, penalty in self.pipeline_map[step_index].resource_penalties.items():
                         self.resource_utilization[resource] -= penalty
 
-                    self._running_processes = [process_tuple for process_tuple in self._running_processes if process_tuple != (step_index, dataset)]
+                    if (step_index, dataset) in self._running_processes:
+                        self._running_processes.remove((step_index, dataset))
+
+
+                    self._finished_processes.append((step_index, dataset))
 
                 elif dataset_step_state.progress == -100:
                     # We delete the p-log.
@@ -136,7 +142,8 @@ class Parallel():
                     for resource, penalty in self.pipeline_map[step_index].resource_penalties.items():
                         self.resource_utilization[resource] -= penalty
 
-                    self._running_processes = [process_tuple for process_tuple in self._running_processes if process_tuple != (step_index, dataset)]
+                    if (step_index, dataset) in self._running_processes:
+                        self._running_processes.remove((step_index, dataset))
 
 
     def _snapshot_to_state_dict(self, snapshot:dict[str, dict[int, process_state]])->None:
@@ -147,6 +154,24 @@ class Parallel():
             self.state_dict[dataset] = snapshot[dataset]
         return
     
+    
+    def _prepopulate_finished_processes(self)->None:
+        """
+        Iterates through the directories and notes which processes have already been finished. Must be done after datasets
+        extracted and pipeline_map flattened.
+        """
+        for step_index, step in enumerate(self.pipeline_map):
+            for dataset in self.datasets:
+                done_dataset_step = True
+                for dir_ext_tuple in step.out:
+                    if not self._has_p_lock(dir_ext_tuple, dataset):
+                        done_dataset_step = False
+                        break
+                if done_dataset_step:
+                    self._finished_processes.append((step_index, dataset))
+        return
+
+                        
 
 
     def _propagate_state_dict(self)->None:
@@ -315,6 +340,21 @@ class Parallel():
         return False
 
 
+    def _get_step_index_from_dir_ext_tuple(self, dir_ext_tuple: tuple[str, str]) -> list[int]:
+        """
+        Returns a list of step_indexes that CAN produce this dir_ext_tuple as output.
+        Note it is most likely that only ONE of these steps will have been completed.
+        The most likely way for there to be more than one step is if there is a router
+        that splits into two parts, and at the end, each of the two branches
+        will write to the same dir_ext_tuple to re-unify the pipeline.
+        """
+        out_step_indexes = []
+        for index, step in enumerate(self.pipeline_map):
+            if dir_ext_tuple in step.out:
+                out_step_indexes.append(index)
+        return out_step_indexes
+
+
     def _is_legal_dataset_step(self, step_index:int, dataset:str, ensure_no_duplicates:bool=True)->bool:
         """ Returns whether it is legal to work on *this* particular *dataset* for this step.
         It assumes the step itself is legal, which it may not be. That should be checked,
@@ -337,6 +377,45 @@ class Parallel():
                     return False
         return True
    
+    
+    def _is_probably_legal_dataset_step(self, step_index:int, dataset:str, ensure_no_duplicates:bool=True)->bool:
+        """
+        Returns whether it is probably legal to work on this particular dataset for this step, assuming the step
+        is itself legal. Checks only running processes to ensure no duplicates. Does not read disk.
+        Checks that it is not finished, and that it has not started. Additionally, that pre-requisite steps
+        are all in finished_tasks.
+        """
+
+        # so now let's check whether all the pre-requisite steps for this dataset are finished.
+        for dir_ext_tuple in self.pipeline_map[step_index].inp:
+            # this is a dir-ext-tuple, not a step. 
+            possible_step_indices: list[int] =  self._get_step_index_from_dir_ext_tuple(dir_ext_tuple)
+            
+            have_done_one: bool = False
+            for step_index in possible_step_indices:
+                step_index_dataset = (step_index, dataset)
+                if step_index_dataset in self._finished_processes:
+                    have_done_one = True
+                    break
+            if not have_done_one:
+                return False
+
+        # if we get here, all prereqs are probably done.
+
+        # Now let's just check that it has not been started nor finished.
+        candidate_step_index_dataset = (step_index, dataset)
+        has_been_started = candidate_step_index_dataset in self._running_processes
+        has_been_finished = candidate_step_index_dataset in self._finished_processes
+
+        if has_been_finished:
+            return False
+        if ensure_no_duplicates:
+            if has_been_started:
+                return False
+        return True
+
+
+
 
     def _get_legal_steps(self)->list[int]:
         """
@@ -383,6 +462,32 @@ class Parallel():
             return out
 
 
+    def find_legal_task_vertical_cache(self)->tuple[int,str]|None:
+        """
+        Returns index of step and string of the dataset of a legal task to complete. Uses the cache. Verifies legality.
+        If no probably legal step, verifies using the deterministic pipeline. None if None in either. Raises ResourceExhaustionException if resources are exhausted.
+        """
+        legal_steps:list[int] = self._get_legal_steps()
+
+        if not legal_steps:
+            raise ResourceExhaustionException()
+
+        # now let's find the first legal dataset step. We will descend so that it follows a vertical path.
+        for step_i in sorted(legal_steps, reverse=True):
+            for dataset in self.datasets:
+                # check probable legality.
+                if not self._is_probably_legal_dataset_step(step_i, dataset):
+                    continue
+                # if probably legal, check full legality. If so, we're done.
+                if self._is_legal_dataset_step(step_i, dataset):
+                    return (step_i, dataset)
+        
+        # If we did not find anything, send it through the normal pipeline in case we missed something.
+        return self._find_legal_task_vertical()
+                    
+
+   
+
     def _find_legal_task(self)->tuple[int, str]|None:
         """
         Returns the index of the step and the string of the dataset of a legal task to complete.
@@ -417,45 +522,6 @@ class Parallel():
         first_task:tuple[int,str] = max(legal_tasks,key=lambda x:x[0])
         return first_task
 
-
-    def _find_legal_task_vertical_cache(self)->tuple[int, str]|None:
-        """
-        Returns index of Step and string of dataset of a legal task to complete.
-        Returns none if none. Can Raise ResourceExhaustionException. Attempts to be vertical.
-        Uses a cache of probably legal tasks to identify a candidate. If the directory 
-        is not being used by anyone else this will only contain always legal. However 
-        the task selected will be verified to be expressly legal, and if it's not, 
-        we will regenerate the cache. This will fail after 3 attempts.
-        Ensure that if you are using the cache, you remove them after you start them.
-        """
-
-        retry_limit: int = 3
-        for _ in range(retry_limit):
-            # First thing to do: generate the cache if one does not exist.
-            if self.legal_task_cache is None:
-                self.legal_task_cache = self._list_all_legal_tasks()
-                
-                if not self.legal_task_cache:
-                    return None
-
-                # sort it
-                self.legal_task_cache.sort(key=lambda x: x[0], reverse=True)
-
-            if not self.legal_task_cache:
-                return None
-
-            # highest level step_i. 
-            cache_first_task:tuple[int,str] = self.legal_task_cache[0]
-            # verify it actually is still legal.
-            if self._is_legal_dataset_step(*cache_first_task):
-                return cache_first_task
-            else:
-                # delete the cache so we can try this again
-                self.legal_task_cache = None
-                continue
-
-        raise RuntimeError("rmPP:Continued cache failures. What's going on in your directory? Consider disabling cache.")
-            
     
 
     def _remove_task_from_legal_task_cache(self, task:tuple[int,str])->None:
@@ -469,9 +535,6 @@ class Parallel():
                 break
         return
         
-
-
-
 
 
     def _are_all_steps_done(self)->bool:
