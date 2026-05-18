@@ -55,7 +55,6 @@ class Parallel():
         self._running_processes:list[tuple[int,str]] = []
         self._finished_processes:list[tuple[int,str]] = []
         self._prepopulate_finished_processes()
-        self.legal_task_cache: list[tuple[int, str]]|None = None
         self.use_vertical_cache:bool = parallel_options.use_vertical_cache
     
     def _init_step_ids(self)->None:
@@ -392,9 +391,9 @@ class Parallel():
             possible_step_indices: list[int] =  self._get_step_index_from_dir_ext_tuple(dir_ext_tuple)
             
             have_done_one: bool = False
-            for step_index in possible_step_indices:
-                step_index_dataset = (step_index, dataset)
-                if step_index_dataset in self._finished_processes:
+            for prereq_step_index in possible_step_indices:
+                prereq_step_index_dataset = (prereq_step_index, dataset)
+                if prereq_step_index_dataset in self._finished_processes:
                     have_done_one = True
                     break
             if not have_done_one:
@@ -462,7 +461,7 @@ class Parallel():
             return out
 
 
-    def find_legal_task_vertical_cache(self)->tuple[int,str]|None:
+    def _find_legal_task_vertical_cache(self)->tuple[int,str]|None:
         """
         Returns index of step and string of the dataset of a legal task to complete. Uses the cache. Verifies legality.
         If no probably legal step, verifies using the deterministic pipeline. None if None in either. Raises ResourceExhaustionException if resources are exhausted.
@@ -524,19 +523,6 @@ class Parallel():
 
     
 
-    def _remove_task_from_legal_task_cache(self, task:tuple[int,str])->None:
-        # cache should be sorted and we usually only want to remove the first
-        # element from it so we'll just do a simple search
-        if not self.legal_task_cache:
-            raise Exception("rmPP: this should not happen. Sorry! Cache-issue. Disable cache.")
-        for index, task_i in enumerate(self.legal_task_cache):
-            if task == task_i:
-                self.legal_task_cache = self.legal_task_cache[:index] + self.legal_task_cache[index+1:]
-                break
-        return
-        
-
-
     def _are_all_steps_done(self)->bool:
         """Returns whether or not all datasets are complete. 
         """
@@ -561,11 +547,7 @@ class Parallel():
 
         for step_index, step in enumerate(self.pipeline_map):
             for dataset in self.datasets:
-                step_dataset_done:bool = False
-                for det in step.out:
-                    if self._has_p_lock(det, dataset)[0]:
-                        step_dataset_done = True
-                        break
+                step_dataset_done: bool = self._has_its_p_file(step_index, dataset, 'p-lock')
                 if not step_dataset_done:
                     out.append((step_index,dataset))
         return out
@@ -801,12 +783,6 @@ class Parallel():
                         continue
 
             self._start_multiprocessing_step_dataset(task[0], task[1])
-
-            if self.use_vertical_cache:
-                self._remove_task_from_legal_task_cache(task)
-
             time.sleep(self.new_instance_timeout / 1000)
 
         print(f"rmPP: stop_reason: {stop_reason}")
-
-
