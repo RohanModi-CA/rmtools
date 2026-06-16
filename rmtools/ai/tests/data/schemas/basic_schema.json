@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "properties": {
+    "status": {
+      "type": "string"
+    },
+    "token": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "status",
+    "token"
+  ],
+  "additionalProperties": false
+}
