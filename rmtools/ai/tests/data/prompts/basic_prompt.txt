@@ -1,0 +1,1 @@
+Reply with the exact token PROMPT_OK.
