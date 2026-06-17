@@ -47,7 +47,7 @@ Now, `OnReturnInfoStruct` contains information for routers. It has: `pipeline_ma
 
 Note: by default, steps will set their progress to 100 when done, creating a g-lock, preventing them from being worked on. This behaviour is usually unwanted for routers. Setting progress to -100 in an on_return function will remove g-log, free resources, but not mark the file as done. gen_verification_router does this automatically if return_val == False.
 
----
+---py
 
 Nesting Steps in a Pipeline Map
 ---
@@ -113,5 +113,11 @@ RecursionBlock
 
 Sometimes, you'd like to recursively iterate on your data. For example, perhaps you put an image in an upscaler. Then, you check, but you determine it is not upscaled enough, 
 so you want to upscale the upscaled image, again, and again. For this, we have RecursionBlocks. 
+
+
+
+
+
+
 
 

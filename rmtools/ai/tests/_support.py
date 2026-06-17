@@ -16,9 +16,7 @@ PROJECT_ROOT = PACKAGE_ROOT.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-
-DEFAULT_PROVIDER = os.getenv("RMTOOLS_TEST_PROVIDER", "openrouter").strip().lower()
-DEFAULT_MODEL = os.getenv("RMTOOLS_TEST_MODEL", "").strip()
+DEFAULT_MODEL = os.getenv("RMTOOLS_TEST_MODEL", "").strip() or "openai/gpt-4o-mini"
 
 
 def data_path(*parts: str) -> Path:
@@ -32,40 +30,11 @@ def require_env(name: str) -> str:
     return value
 
 
-def provider_key(provider: str) -> str:
-    provider = provider.strip().lower()
-    if provider == "openrouter":
-        return require_env("OPENROUTER_API_KEY")
-    if provider == "gemini":
-        return require_env("GEMINI_API_KEY")
-    if provider == "vertex":
-        return require_env("GOOGLE_API_KEY")
-    raise ValueError(f"Unsupported provider: {provider}")
-
-
-def default_model_for_provider(provider: str) -> str:
-    provider = provider.strip().lower()
-    if provider == "openrouter":
-        return "mistralai/ministral-14b-2512"
-    if provider in ("gemini", "vertex"):
-        return "gemini-2.5-flash"
-    raise ValueError(f"Unsupported provider: {provider}")
-
-
-def make_live_instance(provider: str = DEFAULT_PROVIDER, model: str = DEFAULT_MODEL):
+def make_live_instance(model: str = DEFAULT_MODEL):
     from rmtools.ai import AI_Instance
 
-    provider = provider.strip().lower()
-    key = provider_key(provider)
-    model = model or default_model_for_provider(provider)
-
-    if provider == "openrouter":
-        return AI_Instance(openrouter_api_key=key, model=model)
-    if provider == "gemini":
-        return AI_Instance(api_key=key, model=model)
-    if provider == "vertex":
-        return AI_Instance(vertex_api_key=key, model=model)
-    raise ValueError(f"Unsupported provider: {provider}")
+    key = require_env("OPENROUTER_API_KEY")
+    return AI_Instance(openrouter_api_key=key, model=model or DEFAULT_MODEL)
 
 
 def make_offline_instance(model: str = "openai/gpt-4o-mini"):

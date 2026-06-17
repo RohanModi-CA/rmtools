@@ -1,30 +1,9 @@
-from google import genai
 from typing import Any
 import base64
 import json
-import google.genai.errors
-from google.genai import types
 import os
-import warnings
-from dotenv import load_dotenv, find_dotenv
 from urllib import error as urllib_error
 from urllib import request as urllib_request
-
-
-"""
-filter the warning. I think it's through logging but let's leave the warning one as well.
-"""
-thought_signature_warning: str = "there are non-text parts in the response: ['thought_signature']"
-warnings.filterwarnings('ignore', thought_signature_warning)
-import logging
-
-
-class SuppressGenAINonTextWarning(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        return "there are non-text parts in the response" not in record.getMessage()
-
-
-logging.getLogger("google_genai.types").addFilter(SuppressGenAINonTextWarning())
 
 
 class AIRequestError(RuntimeError):
@@ -44,127 +23,33 @@ class AIRequestError(RuntimeError):
 
 
 class AI_Instance:
-    def _model_selector(self, model: str = "", client_mode: str = "gemini") -> str:
-        """Pick a default model without making callers think about backend details."""
-        if client_mode == "openrouter":
-            default_model: str = "openai/gpt-4o-mini"
-        else:
-            default_model: str = "gemini-2.5-flash"
-
+    def _model_selector(self, model: str = "") -> str:
+        """Pick a default OpenRouter model when callers do not specify one."""
         if not model:
-            print(f"rmAI: No Model Specified, Defaulting to {default_model}")
-            model = default_model
-
+            model = "openai/gpt-4o-mini"
+            print(f"rmAI: No Model Specified, Defaulting to {model}")
         return model
 
-    def _env_truthy(self, env_var_name: str) -> bool:
-        return os.getenv(env_var_name, "").lower() in ("true", "1")
-
-    def _thinking_budget_from_level(self, thinking_level: float) -> int:
-        if not 0.0 <= thinking_level <= 1.0:
-            raise ValueError("rmAI: thinking must be between 0 and 1.")
-
-        model_name = self.model.lower()
-
-        if "flash-lite" in model_name:
-            min_budget, max_budget = 0, 24576
-        elif "flash" in model_name:
-            min_budget, max_budget = 0, 24576
-        else:
-            min_budget, max_budget = 128, 32768
-
-        if thinking_level <= 0.0:
-            return min_budget
-
-        if thinking_level >= 1.0:
-            return max_budget
-
-        return round(min_budget + (max_budget - min_budget) * thinking_level)
-
-    def _build_config(self) -> types.GenerateContentConfig | None:
-        config_kwargs = dict(self.config)
-
-        if self.thinking is not None:
-            config_kwargs["thinking_config"] = types.ThinkingConfig(
-                thinking_budget=self._thinking_budget_from_level(self.thinking)
-            )
-
-        if not config_kwargs:
-            return None
-
-        return types.GenerateContentConfig(**config_kwargs)
-
-    def _resolve_auth(self, api_key: str = "", vertex_api_key: str = "", openrouter_api_key: str = "") -> str:
-        if sum(bool(val) for val in (api_key, vertex_api_key, openrouter_api_key)) > 1:
-            raise ValueError("rmAI: Set only one of api_key, vertex_api_key, or openrouter_api_key.")
-
-        if openrouter_api_key:
-            self._api_key = ""
-            self._vertex_api_key = ""
-            self._openrouter_api_key = openrouter_api_key
-            return "openrouter"
-
-        if vertex_api_key:
-            self._api_key = ""
-            self._vertex_api_key = vertex_api_key
-            self._openrouter_api_key = ""
-            return "vertex"
-
-        if api_key:
-            self._api_key = api_key
-            self._vertex_api_key = ""
-            self._openrouter_api_key = ""
-            return "gemini"
-
-        load_dotenv(find_dotenv(usecwd=True))
-
-        self._api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
-        self._vertex_api_key = os.getenv("GOOGLE_API_KEY") or ""
-        self._openrouter_api_key = os.getenv("OPENROUTER_API_KEY") or ""
-
-        if self._openrouter_api_key:
-            return "openrouter"
-
-        if self._vertex_api_key:
-            return "vertex"
-
-        if self._api_key:
-            return "gemini"
-
-        raise ValueError(
-            "rmAI: No API key found. Set api_key, vertex_api_key, openrouter_api_key, GEMINI_API_KEY, GOOGLE_API_KEY, or OPENROUTER_API_KEY."
-        )
-
-    def _create_client(self, api_key: str = "", vertex_api_key: str = "", openrouter_api_key: str = "") -> tuple[Any | None, str]:
-        client_mode = self._resolve_auth(api_key=api_key, vertex_api_key=vertex_api_key, openrouter_api_key=openrouter_api_key)
-
-        if client_mode == "vertex":
-            return genai.Client(vertexai=True, api_key=self._vertex_api_key), client_mode
-
-        if client_mode == "gemini":
-            return genai.Client(api_key=self._api_key), client_mode
-
-        return None, client_mode
+    def _resolve_openrouter_key(self, openrouter_api_key: str = "") -> str:
+        """Resolve the OpenRouter API key or fail immediately."""
+        key = openrouter_api_key.strip()
+        if not key:
+            key = os.getenv("OPENROUTER_API_KEY", "").strip()
+        if not key:
+            raise ValueError("rmAI: Set openrouter_api_key or OPENROUTER_API_KEY.")
+        return key
 
     def __init__(
         self,
-        api_key: str = "",
         model: str = "",
-        vertex_api_key: str = "",
-        thinking: float | None = None,
         openrouter_api_key: str = "",
+        thinking: float | None = None,
     ):
-        self.client, self._client_mode = self._create_client(
-            api_key=api_key,
-            vertex_api_key=vertex_api_key,
-            openrouter_api_key=openrouter_api_key,
-        )
-        self.model: str = self._model_selector(model, client_mode=self._client_mode)
-
+        self._openrouter_api_key = self._resolve_openrouter_key(openrouter_api_key=openrouter_api_key)
+        self.model: str = self._model_selector(model)
         self.config: dict[str, Any] = {}
         self.thinking: float | None = None
         self.transcript: list[dict[str, Any]] = []
-        self._attached_file_uri_paths: dict[str, str] = {}
         self.set_thinking(thinking)
 
     def _text_part(self, text: str) -> dict[str, Any]:
@@ -225,29 +110,8 @@ class AI_Instance:
                 body=body,
             ) from exc
 
-    def _gemini_contents(self, transcript: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        contents: list[dict[str, Any]] = []
-        for entry in transcript:
-            parts: list[dict[str, Any]] = []
-            for part in entry["parts"]:
-                if part["kind"] == "text":
-                    parts.append({"text": part["text"]})
-                elif part["kind"] == "file":
-                    parts.append(
-                        {
-                            "inlineData": {
-                                "mimeType": part["mime_type"],
-                                "data": part["data_b64"],
-                            }
-                        }
-                    )
-                else:
-                    raise ValueError("rmAI: Unknown transcript part kind.")
-            role = "model" if entry["role"] == "assistant" else entry["role"]
-            contents.append({"role": role, "parts": parts})
-        return contents
-
     def _openrouter_messages(self, transcript: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Serialize the transcript into OpenRouter's chat-completions shape."""
         messages: list[dict[str, Any]] = []
         for entry in transcript:
             content_parts: list[dict[str, Any]] = []
@@ -282,24 +146,6 @@ class AI_Instance:
             messages.append({"role": entry["role"], "content": content})
         return messages
 
-    def _vertex_generation_config(self) -> types.GenerateContentConfig | None:
-        config_kwargs: dict[str, Any] = {}
-
-        if self.thinking is not None:
-            config_kwargs["thinking_config"] = types.ThinkingConfig(
-                thinking_budget=self._thinking_budget_from_level(self.thinking)
-            )
-
-        if self.config:
-            config_kwargs["response_mime_type"] = self.config.get("response_mime_type")
-            if "response_json_schema" in self.config:
-                config_kwargs["response_json_schema"] = self.config["response_json_schema"]
-
-        if not config_kwargs:
-            return None
-
-        return types.GenerateContentConfig(**config_kwargs)
-
     def _openrouter_response_format(self) -> dict[str, Any] | None:
         if not self.config:
             return None
@@ -318,6 +164,7 @@ class AI_Instance:
         }
 
     def _extract_response_text(self, response: Any) -> str:
+        """Pull response text out of either a response object or a raw payload."""
         if hasattr(response, "text") and getattr(response, "text") is not None:
             return response.text
 
@@ -353,44 +200,8 @@ class AI_Instance:
                 raise AIRequestError("rmAI: Invalid model output.", body=response_text) from exc
         return response_text
 
-    def _send_gemini_http_message(self, transcript: list[dict[str, Any]]) -> Any:
-        payload: dict[str, Any] = {"contents": self._gemini_contents(transcript)}
-
-        generation_config = self._vertex_generation_config()
-        if generation_config:
-            config_payload = generation_config.model_dump(exclude_none=True)
-            payload["generationConfig"] = {}
-            if config_payload.get("response_mime_type"):
-                payload["generationConfig"]["responseMimeType"] = config_payload["response_mime_type"]
-            if config_payload.get("response_json_schema"):
-                payload["generationConfig"]["responseSchema"] = config_payload["response_json_schema"]
-            if config_payload.get("thinking_config"):
-                payload["generationConfig"]["thinkingConfig"] = config_payload["thinking_config"]
-
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self._api_key}"
-        response = self._http_json_request(url, payload, {"Content-Type": "application/json"})
-        return self._extract_response_text(response)
-
-    def _send_vertex_sdk_message(self, transcript: list[dict[str, Any]]) -> Any:
-        contents: list[Any] = []
-        for entry in transcript:
-            parts: list[Any] = []
-            for part in entry["parts"]:
-                if part["kind"] == "text":
-                    parts.append(types.Part(text=part["text"]))
-                elif part["kind"] == "file":
-                    parts.append(types.Part.from_bytes(data=base64.b64decode(part["data_b64"]), mime_type=part["mime_type"]))
-            role = "model" if entry["role"] == "assistant" else entry["role"]
-            contents.append(types.Content(role=role, parts=parts))
-
-        response = self.client.models.generate_content(
-            model=self.model,
-            contents=contents,
-            config=self._vertex_generation_config(),
-        )
-        return self._extract_response_text(response)
-
     def _send_openrouter_message(self, transcript: list[dict[str, Any]]) -> Any:
+        """Send the transcript to OpenRouter and return the model text."""
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": self._openrouter_messages(transcript),
@@ -417,14 +228,7 @@ class AI_Instance:
 
     def _send_message(self, message: str = "") -> Any:
         transcript = self._pending_transcript(message)
-
-        if self._client_mode == "openrouter":
-            response_text = self._send_openrouter_message(transcript)
-        elif self._client_mode == "vertex":
-            response_text = self._send_vertex_sdk_message(transcript)
-        else:
-            response_text = self._send_gemini_http_message(transcript)
-
+        response_text = self._send_openrouter_message(transcript)
         return self._commit_response(transcript, response_text)
 
     def send_message(self, message: str) -> Any:
@@ -506,13 +310,3 @@ class AI_Instance:
         self.transcript = data.get("transcript", [])
         self.config = data.get("config", {})
         self.thinking = data.get("thinking", None)
-
-    def embed_text(self, text: str) -> list[float]:
-        if not self.client:
-            raise ValueError("rmAI: Embeddings require a Gemini or Vertex client.")
-
-        response = self.client.models.embed_content(
-            model="gemini-embedding-001",
-            contents=text,
-        )
-        return response.embeddings[0].values

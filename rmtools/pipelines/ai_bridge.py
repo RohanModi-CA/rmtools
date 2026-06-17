@@ -1,42 +1,35 @@
 from . import core
 from .. import ai
 from typing import Optional, Any
-from google import genai
-from google.genai import errors
 from urllib import error as urllib_error
 import tenacity
 
 class AI_Instance_PL(ai.AI_Instance):
 
-    def __init__(self, api_key: str = "", model: str = "", vertex_api_key: str = "", openrouter_api_key: str = "", process_state_functions: Optional[core.ProcessStateFunctions]=None, rate_limit_resource_names: list[str]=[])->None:
+    def __init__(self, model: str = "", openrouter_api_key: str = "", process_state_functions: Optional[core.ProcessStateFunctions]=None, rate_limit_resource_names: list[str]|None=None)->None:
         """
         Args:
-            api_key: optional AI Studio/Gemini Developer API key. Can also be set by GOOGLE_API_KEY or GEMINI_API_KEY.
-            model: optional string otherwise defaults to gemini-flash-latest
-            vertex_api_key: optional Vertex AI express API key. Mutually exclusive with api_key.
-            openrouter_api_key: optional OpenRouter API key. Mutually exclusive with the other keys.
+            openrouter_api_key: OpenRouter API key.
             process_state_functions: optional, used to report rate limits to the resources in rate_limit_resource
-            rate_limit_resource_names: optional, even if process_state_functions is set, this can be autofilled. List of string names of resources to report rate limits to in process_state_functions. 
+            rate_limit_resource_names: optional list of resource names to report cooldowns to.
         """
         self.process_state_functions = process_state_functions
         self._set_rate_limit_resource_names(rate_limit_resource_names)
-        super().__init__(api_key=api_key, model=model, vertex_api_key=vertex_api_key, openrouter_api_key=openrouter_api_key)
+        super().__init__(model=model, openrouter_api_key=openrouter_api_key)
 
         
         self._EXPONENTIAL_BACKOFF = tenacity.wait_exponential(min=1, max=300, multiplier=2) 
     
         self.send_message = tenacity.retry(wait=self._get_retry_time_send_upstream_s, reraise=True)(self.send_message)
 
-    def _set_rate_limit_resource_names(self, rate_limit_resource_names:list[str])->None:
-        if rate_limit_resource_names:
-            self.rate_limit_resource_names = rate_limit_resource_names
-        else:
-            if self.process_state_functions:
-                self.rate_limit_resource_names = self.process_state_functions.rate_limit_resource_names
+    def _set_rate_limit_resource_names(self, rate_limit_resource_names:list[str]|None)->None:
+        self.rate_limit_resource_names = rate_limit_resource_names or []
+        if not self.rate_limit_resource_names and self.process_state_functions:
+            self.rate_limit_resource_names = self.process_state_functions.rate_limit_resource_names
         return
     
     
-    def _read_error_time_ms(self, api_error: errors.APIError|BaseException)->int:
+    def _read_error_time_ms(self, api_error: BaseException)->int:
         """
         Returns an int amount of milliseconds to wait based on a rate limit error. If we can't figure it out, return -1.
         """
@@ -50,18 +43,6 @@ class AI_Instance_PL(ai.AI_Instance):
                     return int(float(retry_after) * 1000)
                 except ValueError:
                     pass
-
-        try:
-            details = api_error.details.get('error', {}).get('details', [])
-            for detail in details:
-                if detail.get('@type') == 'type.googleapis.com/google.rpc.RetryInfo':
-                    delay_str = detail.get('retryDelay', '')
-                    if delay_str.endswith('s'):
-                        return 1000* (2+int(delay_str[:-1]))
-        except (AttributeError, KeyError, ValueError):
-            pass
-        
-        print(api_error)
 
         return -1
         
@@ -112,5 +93,3 @@ class AI_Instance_PL(ai.AI_Instance):
         if alert_replied:
             print("AI_Instance_PL: Received response.")
         return response
-
-
