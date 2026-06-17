@@ -36,6 +36,12 @@ class AIRequestError(RuntimeError):
         self.retry_after_ms = retry_after_ms
         self.body = body
 
+    def __str__(self) -> str:
+        if not self.body:
+            return super().__str__()
+
+        return f"{super().__str__()}\n{self.body}"
+
 
 class AI_Instance:
     def _model_selector(self, model: str = "", client_mode: str = "gemini") -> str:
@@ -341,7 +347,10 @@ class AI_Instance:
         self.transcript = committed
 
         if self.config:
-            return dict(json.loads(response_text))
+            try:
+                return dict(json.loads(response_text))
+            except json.JSONDecodeError as exc:
+                raise AIRequestError("rmAI: Invalid model output.", body=response_text) from exc
         return response_text
 
     def _send_gemini_http_message(self, transcript: list[dict[str, Any]]) -> Any:

@@ -54,6 +54,7 @@ class Parallel():
 
         self._running_processes:list[tuple[int,str]] = []
         self._finished_processes:list[tuple[int,str]] = []
+        print("rmPP: Prepopulating finished processes.")
         self._prepopulate_finished_processes()
         self.use_vertical_cache:bool = parallel_options.use_vertical_cache
     
@@ -169,8 +170,6 @@ class Parallel():
                 if done_dataset_step:
                     self._finished_processes.append((step_index, dataset))
         return
-
-                        
 
 
     def _propagate_state_dict(self)->None:
