@@ -20,12 +20,14 @@ Scripts:
 - `python tests/live_schema.py`
 - `python tests/live_context.py`
 - `python tests/live_smoke.py`
+- `python tests/live_function_calling.py`
 
 ## Offline scripts
 
 - `python tests/offline_transcript.py`
 - `python tests/offline_serialization.py`
 - `python tests/offline_auth.py`
+- `python tests/offline_function_calling.py`
 
 ## Data files
 
