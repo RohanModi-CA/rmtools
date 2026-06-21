@@ -2,10 +2,8 @@ from __future__ import annotations
 
 from _support import (
     DEFAULT_MODEL,
-    DEFAULT_PROVIDER,
     assert_contains,
     assert_nonempty_text,
-    default_model_for_provider,
     data_path,
     dump_json,
     make_live_instance,
@@ -13,16 +11,14 @@ from _support import (
 )
 
 
-PROVIDER = DEFAULT_PROVIDER
-MODEL = DEFAULT_MODEL or default_model_for_provider(PROVIDER)
+MODEL = DEFAULT_MODEL
 
 
 def main() -> None:
     print_header("Live Text")
-    print(f"provider={PROVIDER}")
     print(f"model={MODEL}")
 
-    ai = make_live_instance(PROVIDER, MODEL)
+    ai = make_live_instance(MODEL)
 
     ai.attach_text("Reply with the exact token INLINE_OK.")
     inline_response = assert_nonempty_text(ai.send_message("What token should you reply with?"))

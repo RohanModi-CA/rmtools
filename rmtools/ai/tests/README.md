@@ -7,11 +7,10 @@ This folder is a small executable harness, not a pytest suite.
 Default target:
 
 - `OPENROUTER_API_KEY`
-- `RMTOOLS_TEST_MODEL=mistralai/ministral-14b-2512`
+- `RMTOOLS_TEST_MODEL=openai/gpt-4o-mini`
 
 Optional:
 
-- `RMTOOLS_TEST_PROVIDER=openrouter|gemini|vertex`
 - `RMTOOLS_TEST_IMAGE_PATH=/path/to/local/image.png`
 
 Scripts:
@@ -21,11 +20,14 @@ Scripts:
 - `python tests/live_schema.py`
 - `python tests/live_context.py`
 - `python tests/live_smoke.py`
+- `python tests/live_function_calling.py`
 
 ## Offline scripts
 
 - `python tests/offline_transcript.py`
 - `python tests/offline_serialization.py`
+- `python tests/offline_auth.py`
+- `python tests/offline_function_calling.py`
 
 ## Data files
 

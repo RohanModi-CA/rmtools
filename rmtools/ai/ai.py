@@ -1,30 +1,10 @@
-from google import genai
-from typing import Any
+from typing import Any, Callable
 import base64
 import json
-import google.genai.errors
-from google.genai import types
 import os
 import warnings
-from dotenv import load_dotenv, find_dotenv
 from urllib import error as urllib_error
 from urllib import request as urllib_request
-
-
-"""
-filter the warning. I think it's through logging but let's leave the warning one as well.
-"""
-thought_signature_warning: str = "there are non-text parts in the response: ['thought_signature']"
-warnings.filterwarnings('ignore', thought_signature_warning)
-import logging
-
-
-class SuppressGenAINonTextWarning(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        return "there are non-text parts in the response" not in record.getMessage()
-
-
-logging.getLogger("google_genai.types").addFilter(SuppressGenAINonTextWarning())
 
 
 class AIRequestError(RuntimeError):
@@ -44,127 +24,141 @@ class AIRequestError(RuntimeError):
 
 
 class AI_Instance:
-    def _model_selector(self, model: str = "", client_mode: str = "gemini") -> str:
-        """Pick a default model without making callers think about backend details."""
-        if client_mode == "openrouter":
-            default_model: str = "openai/gpt-4o-mini"
-        else:
-            default_model: str = "gemini-2.5-flash"
-
+    def _model_selector(self, model: str = "") -> str:
+        """Pick a default OpenRouter model when callers do not specify one."""
         if not model:
-            print(f"rmAI: No Model Specified, Defaulting to {default_model}")
-            model = default_model
-
+            model = "openai/gpt-4o-mini"
+            print(f"rmAI: No Model Specified, Defaulting to {model}")
         return model
 
-    def _env_truthy(self, env_var_name: str) -> bool:
-        return os.getenv(env_var_name, "").lower() in ("true", "1")
+    def _resolve_openrouter_key(self, openrouter_api_key: str = "") -> str:
+        """Resolve the OpenRouter API key or fail immediately."""
+        key = openrouter_api_key.strip()
+        if not key:
+            key = os.getenv("OPENROUTER_API_KEY", "").strip()
+        if not key:
+            raise ValueError("rmAI: Set openrouter_api_key or OPENROUTER_API_KEY.")
+        return key
 
-    def _thinking_budget_from_level(self, thinking_level: float) -> int:
-        if not 0.0 <= thinking_level <= 1.0:
-            raise ValueError("rmAI: thinking must be between 0 and 1.")
+    def _normalize_tool_defs(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Keep only OpenAI-style function tools and make the shape explicit."""
+        normalized: list[dict[str, Any]] = []
+        for tool in tools:
+            if tool.get("type") != "function":
+                raise ValueError("rmAI: Only function tools are supported.")
 
-        model_name = self.model.lower()
+            function = tool.get("function", {})
+            name = function.get("name", "").strip()
+            if not name:
+                raise ValueError("rmAI: Each tool must have a function name.")
 
-        if "flash-lite" in model_name:
-            min_budget, max_budget = 0, 24576
-        elif "flash" in model_name:
-            min_budget, max_budget = 0, 24576
+            normalized.append(tool)
+        return normalized
+
+    def _tool_name(self, tool: dict[str, Any]) -> str:
+        """Read the function name from one tool definition."""
+        function = tool.get("function", {})
+        return function.get("name", "")
+
+    def _normalize_function_aliases(self, function_aliases: list[tuple[str, Callable[..., Any]]] | None) -> dict[str, Callable[..., Any]]:
+        """Turn the alias list into a small name-to-callable map."""
+        aliases: dict[str, Callable[..., Any]] = {}
+        for name, func in function_aliases or []:
+            if name in aliases:
+                raise ValueError(f"rmAI: Duplicate function alias: {name}")
+            aliases[name] = func
+        return aliases
+
+    def _load_tool_schema(self, schema_filepath: str | None, schema_str: str | None) -> list[dict[str, Any]] | None:
+        """Load a tool schema from disk or memory and return the tool list."""
+        if schema_filepath and schema_str:
+            raise ValueError("rmtools.ai: Function calling takes a filepath OR the string of the JSON, not both.")
+
+        if schema_filepath:
+            with open(schema_filepath, "r") as schema:
+                json_str = schema.read()
+        elif schema_str:
+            json_str = schema_str
         else:
-            min_budget, max_budget = 128, 32768
-
-        if thinking_level <= 0.0:
-            return min_budget
-
-        if thinking_level >= 1.0:
-            return max_budget
-
-        return round(min_budget + (max_budget - min_budget) * thinking_level)
-
-    def _build_config(self) -> types.GenerateContentConfig | None:
-        config_kwargs = dict(self.config)
-
-        if self.thinking is not None:
-            config_kwargs["thinking_config"] = types.ThinkingConfig(
-                thinking_budget=self._thinking_budget_from_level(self.thinking)
-            )
-
-        if not config_kwargs:
             return None
 
-        return types.GenerateContentConfig(**config_kwargs)
+        schema = json.loads(json_str)
+        if isinstance(schema, list):
+            return self._normalize_tool_defs(schema)
 
-    def _resolve_auth(self, api_key: str = "", vertex_api_key: str = "", openrouter_api_key: str = "") -> str:
-        if sum(bool(val) for val in (api_key, vertex_api_key, openrouter_api_key)) > 1:
-            raise ValueError("rmAI: Set only one of api_key, vertex_api_key, or openrouter_api_key.")
+        if isinstance(schema, dict) and "tools" in schema:
+            tools = schema["tools"]
+            if not isinstance(tools, list):
+                raise ValueError("rmAI: tools must be a list.")
+            return self._normalize_tool_defs(tools)
 
-        if openrouter_api_key:
-            self._api_key = ""
-            self._vertex_api_key = ""
-            self._openrouter_api_key = openrouter_api_key
-            return "openrouter"
+        raise ValueError("rmAI: Function calling schema must be a tools array or an object with a tools key.")
 
-        if vertex_api_key:
-            self._api_key = ""
-            self._vertex_api_key = vertex_api_key
-            self._openrouter_api_key = ""
-            return "vertex"
+    def _validate_function_calling(self, tools: list[dict[str, Any]], aliases: dict[str, Callable[..., Any]], forced: list[str]) -> None:
+        """Check that every advertised tool has a callable and that forced names exist."""
+        tool_names = [self._tool_name(tool) for tool in tools]
 
-        if api_key:
-            self._api_key = api_key
-            self._vertex_api_key = ""
-            self._openrouter_api_key = ""
-            return "gemini"
+        missing_aliases = [name for name in tool_names if name not in aliases]
+        if missing_aliases:
+            raise ValueError(f"rmAI: Missing callables for tools: {', '.join(missing_aliases)}")
 
-        load_dotenv(find_dotenv(usecwd=True))
+        extra_aliases = [name for name in aliases if name not in tool_names]
+        if extra_aliases:
+            warnings.warn(
+                f"rmAI: Ignoring function aliases not present in the schema: {', '.join(extra_aliases)}",
+                stacklevel=2,
+            )
 
-        self._api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
-        self._vertex_api_key = os.getenv("GOOGLE_API_KEY") or ""
-        self._openrouter_api_key = os.getenv("OPENROUTER_API_KEY") or ""
+        unknown_forced = [name for name in forced if name not in tool_names]
+        if unknown_forced:
+            raise ValueError(f"rmAI: Forced function names not present in the schema: {', '.join(unknown_forced)}")
 
-        if self._openrouter_api_key:
-            return "openrouter"
+    def _reset_function_calling(self) -> None:
+        """Clear the runtime tool-calling state without touching structured output."""
+        self._function_tools = []
+        self._function_aliases = {}
+        self._forced_function_names = []
+        self._parallel_tool_calls: bool | None = None
+        self._pause_after_tool_execution = False
+        self._function_calling_enabled = False
 
-        if self._vertex_api_key:
-            return "vertex"
+    def _stringify_tool_result(self, result: Any) -> str:
+        """Turn a tool return value into content the model can read back."""
+        if isinstance(result, str):
+            return result
 
-        if self._api_key:
-            return "gemini"
+        try:
+            return json.dumps(result)
+        except TypeError as exc:
+            raise TypeError("rmAI: Tool results must be JSON serializable or plain strings.") from exc
 
-        raise ValueError(
-            "rmAI: No API key found. Set api_key, vertex_api_key, openrouter_api_key, GEMINI_API_KEY, GOOGLE_API_KEY, or OPENROUTER_API_KEY."
-        )
+    def _force_tool_choice(self) -> dict[str, Any] | str | None:
+        """Convert the forced-name list into one OpenRouter tool_choice value."""
+        if not self._forced_function_names:
+            return None
 
-    def _create_client(self, api_key: str = "", vertex_api_key: str = "", openrouter_api_key: str = "") -> tuple[Any | None, str]:
-        client_mode = self._resolve_auth(api_key=api_key, vertex_api_key=vertex_api_key, openrouter_api_key=openrouter_api_key)
+        if len(self._forced_function_names) == 1:
+            return {
+                "type": "function",
+                "function": {
+                    "name": self._forced_function_names[0],
+                },
+            }
 
-        if client_mode == "vertex":
-            return genai.Client(vertexai=True, api_key=self._vertex_api_key), client_mode
-
-        if client_mode == "gemini":
-            return genai.Client(api_key=self._api_key), client_mode
-
-        return None, client_mode
+        return "required"
 
     def __init__(
         self,
-        api_key: str = "",
         model: str = "",
-        vertex_api_key: str = "",
-        thinking: float | None = None,
         openrouter_api_key: str = "",
+        thinking: float | None = None,
     ):
-        self.client, self._client_mode = self._create_client(
-            api_key=api_key,
-            vertex_api_key=vertex_api_key,
-            openrouter_api_key=openrouter_api_key,
-        )
-        self.model: str = self._model_selector(model, client_mode=self._client_mode)
-
+        self._openrouter_api_key = self._resolve_openrouter_key(openrouter_api_key=openrouter_api_key)
+        self.model: str = self._model_selector(model)
         self.config: dict[str, Any] = {}
         self.thinking: float | None = None
         self.transcript: list[dict[str, Any]] = []
-        self._attached_file_uri_paths: dict[str, str] = {}
+        self._reset_function_calling()
         self.set_thinking(thinking)
 
     def _text_part(self, text: str) -> dict[str, Any]:
@@ -225,29 +219,8 @@ class AI_Instance:
                 body=body,
             ) from exc
 
-    def _gemini_contents(self, transcript: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        contents: list[dict[str, Any]] = []
-        for entry in transcript:
-            parts: list[dict[str, Any]] = []
-            for part in entry["parts"]:
-                if part["kind"] == "text":
-                    parts.append({"text": part["text"]})
-                elif part["kind"] == "file":
-                    parts.append(
-                        {
-                            "inlineData": {
-                                "mimeType": part["mime_type"],
-                                "data": part["data_b64"],
-                            }
-                        }
-                    )
-                else:
-                    raise ValueError("rmAI: Unknown transcript part kind.")
-            role = "model" if entry["role"] == "assistant" else entry["role"]
-            contents.append({"role": role, "parts": parts})
-        return contents
-
     def _openrouter_messages(self, transcript: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Serialize the transcript into OpenRouter's chat-completions shape."""
         messages: list[dict[str, Any]] = []
         for entry in transcript:
             content_parts: list[dict[str, Any]] = []
@@ -279,26 +252,95 @@ class AI_Instance:
             else:
                 content = "\n".join(text_chunks)
 
-            messages.append({"role": entry["role"], "content": content})
+            message: dict[str, Any] = {"role": entry["role"], "content": content}
+            if entry["role"] == "assistant" and entry.get("tool_calls"):
+                message["tool_calls"] = entry["tool_calls"]
+                if not content:
+                    message["content"] = None
+            if entry["role"] == "tool" and entry.get("tool_call_id"):
+                message["tool_call_id"] = entry["tool_call_id"]
+            messages.append(message)
         return messages
 
-    def _vertex_generation_config(self) -> types.GenerateContentConfig | None:
-        config_kwargs: dict[str, Any] = {}
+    def _function_calling_request_payload(self, allow_force: bool = True) -> dict[str, Any]:
+        """Build the request fields that belong to function calling."""
+        payload: dict[str, Any] = {}
+        if not self._function_calling_enabled:
+            return payload
 
-        if self.thinking is not None:
-            config_kwargs["thinking_config"] = types.ThinkingConfig(
-                thinking_budget=self._thinking_budget_from_level(self.thinking)
-            )
+        tools = self._function_tools
+        if self._forced_function_names:
+            forced_names = set(self._forced_function_names)
+            tools = [tool for tool in tools if self._tool_name(tool) in forced_names]
 
-        if self.config:
-            config_kwargs["response_mime_type"] = self.config.get("response_mime_type")
-            if "response_json_schema" in self.config:
-                config_kwargs["response_json_schema"] = self.config["response_json_schema"]
+        if tools:
+            payload["tools"] = tools
 
-        if not config_kwargs:
-            return None
+        tool_choice = self._force_tool_choice() if allow_force else None
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
 
-        return types.GenerateContentConfig(**config_kwargs)
+        if self._parallel_tool_calls is not None:
+            payload["parallel_tool_calls"] = self._parallel_tool_calls
+
+        return payload
+
+    def _response_message_text(self, message: dict[str, Any]) -> str:
+        """Read plain text back from an OpenRouter assistant message."""
+        content = message.get("content", "")
+        if isinstance(content, list):
+            text_bits = [part.get("text", "") for part in content if isinstance(part, dict)]
+            return "".join(text_bits)
+        if content is None:
+            return ""
+        return str(content)
+
+    def _response_message_to_transcript_entry(self, message: dict[str, Any]) -> dict[str, Any]:
+        """Turn one OpenRouter response message into the transcript shape."""
+        entry: dict[str, Any] = {"role": message.get("role", "assistant"), "parts": []}
+        text = self._response_message_text(message)
+        if text:
+            entry["parts"] = [self._text_part(text)]
+        if message.get("tool_calls"):
+            entry["tool_calls"] = message["tool_calls"]
+        return entry
+
+    def _tool_result_entry(self, tool_call_id: str, result: Any) -> dict[str, Any]:
+        """Store one tool result in the transcript."""
+        return {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "parts": [self._text_part(self._stringify_tool_result(result))],
+        }
+
+    def _execute_tool_call(self, tool_call: dict[str, Any]) -> Any:
+        """Run one tool call by name and pass the JSON arguments to its callable."""
+        function = tool_call.get("function", {})
+        tool_name = function.get("name", "")
+        if tool_name not in self._function_aliases:
+            raise ValueError(f"rmAI: No callable registered for tool: {tool_name}")
+
+        arguments = function.get("arguments", {})
+        if isinstance(arguments, str):
+            arguments = json.loads(arguments or "{}")
+
+        if not isinstance(arguments, dict):
+            raise ValueError("rmAI: Tool arguments must be a JSON object.")
+
+        return self._function_aliases[tool_name](**arguments)
+
+    def _append_tool_calls(self, transcript: list[dict[str, Any]], tool_calls: list[dict[str, Any]]) -> bool:
+        """Append the tool results that follow one assistant tool-call message."""
+        paused = False
+        for tool_call in tool_calls:
+            result = self._execute_tool_call(tool_call)
+            transcript.append(self._tool_result_entry(tool_call.get("id", ""), result))
+            paused = paused or self._pause_after_tool_execution
+        return paused
+
+    def _commit_transcript(self, transcript: list[dict[str, Any]]) -> None:
+        """Publish the working transcript onto the instance."""
+        self.transcript = [dict(entry) for entry in transcript]
 
     def _openrouter_response_format(self) -> dict[str, Any] | None:
         if not self.config:
@@ -317,30 +359,6 @@ class AI_Instance:
             },
         }
 
-    def _extract_response_text(self, response: Any) -> str:
-        if hasattr(response, "text") and getattr(response, "text") is not None:
-            return response.text
-
-        if isinstance(response, dict):
-            if "choices" in response:
-                choice = response.get("choices", [{}])[0]
-                message = choice.get("message", {})
-                content = message.get("content", "")
-                if isinstance(content, list):
-                    text_bits = [part.get("text", "") for part in content if isinstance(part, dict)]
-                    return "".join(text_bits)
-                return content or ""
-
-            candidates = response.get("candidates", [])
-            if candidates:
-                content = candidates[0].get("content", {})
-                parts = content.get("parts", [])
-                text_bits = [part.get("text", "") for part in parts if isinstance(part, dict)]
-                if text_bits:
-                    return "".join(text_bits)
-
-        raise ValueError("rmAI: Could not read model response text.")
-
     def _commit_response(self, transcript: list[dict[str, Any]], response_text: str) -> Any:
         committed = [dict(entry) for entry in transcript]
         self._append_message(committed, "assistant", [self._text_part(response_text)])
@@ -353,44 +371,8 @@ class AI_Instance:
                 raise AIRequestError("rmAI: Invalid model output.", body=response_text) from exc
         return response_text
 
-    def _send_gemini_http_message(self, transcript: list[dict[str, Any]]) -> Any:
-        payload: dict[str, Any] = {"contents": self._gemini_contents(transcript)}
-
-        generation_config = self._vertex_generation_config()
-        if generation_config:
-            config_payload = generation_config.model_dump(exclude_none=True)
-            payload["generationConfig"] = {}
-            if config_payload.get("response_mime_type"):
-                payload["generationConfig"]["responseMimeType"] = config_payload["response_mime_type"]
-            if config_payload.get("response_json_schema"):
-                payload["generationConfig"]["responseSchema"] = config_payload["response_json_schema"]
-            if config_payload.get("thinking_config"):
-                payload["generationConfig"]["thinkingConfig"] = config_payload["thinking_config"]
-
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self._api_key}"
-        response = self._http_json_request(url, payload, {"Content-Type": "application/json"})
-        return self._extract_response_text(response)
-
-    def _send_vertex_sdk_message(self, transcript: list[dict[str, Any]]) -> Any:
-        contents: list[Any] = []
-        for entry in transcript:
-            parts: list[Any] = []
-            for part in entry["parts"]:
-                if part["kind"] == "text":
-                    parts.append(types.Part(text=part["text"]))
-                elif part["kind"] == "file":
-                    parts.append(types.Part.from_bytes(data=base64.b64decode(part["data_b64"]), mime_type=part["mime_type"]))
-            role = "model" if entry["role"] == "assistant" else entry["role"]
-            contents.append(types.Content(role=role, parts=parts))
-
-        response = self.client.models.generate_content(
-            model=self.model,
-            contents=contents,
-            config=self._vertex_generation_config(),
-        )
-        return self._extract_response_text(response)
-
-    def _send_openrouter_message(self, transcript: list[dict[str, Any]]) -> Any:
+    def _send_openrouter_message(self, transcript: list[dict[str, Any]], allow_force: bool = True) -> Any:
+        """Send the transcript to OpenRouter and return the model text."""
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": self._openrouter_messages(transcript),
@@ -399,6 +381,10 @@ class AI_Instance:
         response_format = self._openrouter_response_format()
         if response_format:
             payload["response_format"] = response_format
+
+        function_calling_payload = self._function_calling_request_payload(allow_force=allow_force)
+        if function_calling_payload:
+            payload.update(function_calling_payload)
 
         headers: dict[str, str] = {
             "Authorization": f"Bearer {self._openrouter_api_key}",
@@ -413,19 +399,34 @@ class AI_Instance:
             headers["X-Title"] = app_title
 
         response = self._http_json_request("https://openrouter.ai/api/v1/chat/completions", payload, headers)
-        return self._extract_response_text(response)
+        choices = response.get("choices", [])
+        if not choices:
+            raise ValueError("rmAI: Could not read model response text.")
+
+        message = choices[0].get("message", {})
+        if not isinstance(message, dict):
+            raise ValueError("rmAI: Could not read model response text.")
+        return message
 
     def _send_message(self, message: str = "") -> Any:
         transcript = self._pending_transcript(message)
+        allow_force = True
+        while True:
+            message_dict = self._send_openrouter_message(transcript, allow_force=allow_force)
+            allow_force = False
+            tool_calls = message_dict.get("tool_calls", [])
 
-        if self._client_mode == "openrouter":
-            response_text = self._send_openrouter_message(transcript)
-        elif self._client_mode == "vertex":
-            response_text = self._send_vertex_sdk_message(transcript)
-        else:
-            response_text = self._send_gemini_http_message(transcript)
+            if tool_calls:
+                transcript.append(self._response_message_to_transcript_entry(message_dict))
+                self._commit_transcript(transcript)
+                paused = self._append_tool_calls(transcript, tool_calls)
+                self._commit_transcript(transcript)
+                if paused:
+                    return None
+                continue
 
-        return self._commit_response(transcript, response_text)
+            response_text = self._response_message_text(message_dict)
+            return self._commit_response(transcript, response_text)
 
     def send_message(self, message: str) -> Any:
         return self._send_message(message)
@@ -439,6 +440,39 @@ class AI_Instance:
             raise ValueError("rmAI: thinking must be between 0 and 1.")
 
         self.thinking = thinking
+
+    def function_calling(
+        self,
+        function_aliases: list[tuple[str, Callable[..., Any]]] | None = None,
+        schema_filepath: str | None = None,
+        schema_str: str | None = None,
+        force_function_calling: list[str] | None = None,
+        parallel_tool_calls: bool | None = None,
+        pause_after_tool_execution: bool = False,
+    ) -> None:
+        """Set or clear the tool-calling schema used on future requests."""
+        tools = self._load_tool_schema(schema_filepath=schema_filepath, schema_str=schema_str)
+        if tools is None:
+            if any([function_aliases, force_function_calling, parallel_tool_calls is not None, pause_after_tool_execution]):
+                raise ValueError("rmAI: Function aliases and forcing require a function schema.")
+            self._reset_function_calling()
+            return
+
+        aliases = self._normalize_function_aliases(function_aliases)
+        forced = list(dict.fromkeys(force_function_calling or []))
+        if parallel_tool_calls is not None and not isinstance(parallel_tool_calls, bool):
+            raise ValueError("rmAI: parallel_tool_calls must be True, False, or None.")
+        if not isinstance(pause_after_tool_execution, bool):
+            raise ValueError("rmAI: pause_after_tool_execution must be True or False.")
+
+        self._validate_function_calling(tools=tools, aliases=aliases, forced=forced)
+
+        self._function_tools = tools
+        self._function_aliases = aliases
+        self._forced_function_names = forced
+        self._parallel_tool_calls = parallel_tool_calls
+        self._pause_after_tool_execution = pause_after_tool_execution
+        self._function_calling_enabled = True
 
     def _infer_mime_type(self, path: str) -> str:
         import mimetypes
@@ -506,13 +540,3 @@ class AI_Instance:
         self.transcript = data.get("transcript", [])
         self.config = data.get("config", {})
         self.thinking = data.get("thinking", None)
-
-    def embed_text(self, text: str) -> list[float]:
-        if not self.client:
-            raise ValueError("rmAI: Embeddings require a Gemini or Vertex client.")
-
-        response = self.client.models.embed_content(
-            model="gemini-embedding-001",
-            contents=text,
-        )
-        return response.embeddings[0].values
